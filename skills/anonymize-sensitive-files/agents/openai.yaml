@@ -1,0 +1,4 @@
+interface:
+  display_name: "Anonymize Sensitive Files"
+  short_description: "Replace sensitive document data with realistic fake values."
+  default_prompt: "Use $anonymize-sensitive-files to anonymize sensitive information in documents while preserving readable structure and generating a safety report."
