@@ -180,14 +180,18 @@ python3 scripts/run_anonymize.py --help
 .venv/bin/python -m unittest discover -s scripts -p 'test_*.py'
 ```
 
-## 发布说明
+## GitHub 发布说明
 
-本仓库是一个通用 GitHub 发布结构，实际 skill 位于：
+实际 skill 位于：
 
 ```text
 skills/anonymize-sensitive-files/
 ```
 
-发布到 GitHub 后，支持 repo path 安装的 agent/skill 平台可以引用这个目录。
+支持 repo path 安装的 agent/skill 平台可以引用这个目录。
 
-当前仓库暂未附带开源许可证。公开发布前请根据你的分发目标选择合适的 LICENSE。
+公开发布时请只提交源码、规则、文档和测试，不要提交真实业务文件、脱敏输入样本、运行报告、明文映射文件、生成的脱敏副本或本地虚拟环境目录。尤其是 `--export-mapping` 生成的映射文件包含原始敏感值，只应保存在受控位置。
+
+## 开源协议
+
+本项目使用 Apache License 2.0 发布，详见仓库根目录的 `LICENSE` 文件。
