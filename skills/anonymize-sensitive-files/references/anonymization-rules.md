@@ -31,7 +31,7 @@ The CLI loads `references/sensitive-field-rules.yaml` by default for every suppo
 - `注册地址`, `收货地址`, `送达地址`, `签署地点`
 - `合同编号`, `订单编号`, `项目编号`, `序列号`, `资产编号`
 
-Rules support `字段：值` text and DOCX table rows where the label is in one cell and the value is in the cell immediately to the right. Use `--field-rules custom.yaml` to replace the bundled rules or `--no-field-rules` to disable them while debugging false positives.
+Rules support `字段：值` text, DOCX table rows, Excel worksheet rows where the label is in one cell and the value is in the cell immediately to the right, and simple Excel column headers where values appear below a header label. Excel field rules skip neighboring field labels and common header cells to avoid rewriting table headers as values. Use `--field-rules custom.yaml` to replace the bundled rules or `--no-field-rules` to disable them while debugging false positives.
 
 ## Fake Data Pools
 
@@ -84,7 +84,7 @@ Blank lines and lines starting with `#` are ignored.
 
 ## Mapping Artifacts
 
-Default reports do not contain original sensitive values. If `--mapping` is used without `--export-mapping`, the mapping file stores salted hashes of originals and fake replacements. Without `--seed`, the salt is random for each run.
+Default reports do not contain original sensitive values or raw file paths. File paths are represented as safe hash-like references plus extensions. Excel findings use safe coordinates such as `sheet 1!B2` and do not include raw worksheet titles. If `--mapping` is used without `--export-mapping`, the mapping file stores salted hashes of originals and fake replacements. Without `--seed`, the salt is random for each run.
 
 Use `--seed` only when stable mapping hashes are needed across runs. Choose a high-entropy seed; low-entropy seeds can make phone numbers, IDs, and other enumerable values vulnerable to dictionary checks.
 

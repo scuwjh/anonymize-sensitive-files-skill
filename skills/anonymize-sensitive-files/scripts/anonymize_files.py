@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Iterable
@@ -20,7 +22,32 @@ from fake_data import KNOWN_FAKE_VALUES, FakeDataFactory, normalize_category
 
 
 SUPPORTED_TEXT_EXTENSIONS = {".md", ".markdown", ".txt", ".text", ".csv", ".tsv", ".json", ".yaml", ".yml"}
-SUPPORTED_EXTENSIONS = SUPPORTED_TEXT_EXTENSIONS | {".docx", ".pdf"}
+SUPPORTED_EXCEL_EXTENSIONS = {".xlsx", ".xlsm"}
+SUPPORTED_EXTENSIONS = SUPPORTED_TEXT_EXTENSIONS | {".docx", ".pdf"} | SUPPORTED_EXCEL_EXTENSIONS
+EXCEL_HYPERLINK_TEXT_ATTRIBUTES = ("target", "location", "display", "tooltip")
+EXCEL_WORKBOOK_PROPERTY_ATTRIBUTES = (
+    "creator",
+    "lastModifiedBy",
+    "title",
+    "subject",
+    "description",
+    "keywords",
+    "category",
+    "contentStatus",
+    "identifier",
+    "language",
+    "version",
+    "revision",
+)
+EXCEL_TABLE_HEADER_VALUES = frozenset({"项目", "日期", "签字", "签名", "盖章", "签章", "字段", "值"})
+INVALID_EXCEL_SHEET_TITLE_CHARS = re.compile(r"[\[\]:*?/\\]")
+
+
+class ProcessingError(RuntimeError):
+    def __init__(self, message: str, findings: list[Finding] | None = None, warnings: list[str] | None = None):
+        super().__init__(message)
+        self.findings = findings or []
+        self.warnings = warnings or []
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -56,32 +83,45 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 2
 
-    custom_terms = load_custom_terms(args.terms)
-    field_rules = load_field_rules(args.field_rules, use_default=not args.no_field_rules)
+    try:
+        custom_terms = load_custom_terms(args.terms)
+        field_rules = load_field_rules(args.field_rules, use_default=not args.no_field_rules)
+    except Exception as exc:
+        print(
+            json.dumps({"error": safe_error_message(str(exc), *argument_paths(args))}, ensure_ascii=False, indent=2),
+            file=sys.stderr,
+        )
+        return 2
     factory = FakeDataFactory(seed=args.seed)
     results = []
 
     for path in inputs:
+        output_path = output_paths.get(path)
         try:
-            results.append(process_file(path, args, custom_terms, field_rules, factory, output_paths.get(path)))
+            results.append(process_file(path, args, custom_terms, field_rules, factory, output_path))
+        except ProcessingError as exc:
+            result = result_for(path, None, "error", exc.findings, exc.warnings)
+            result["error"] = safe_error_message(str(exc), *paths_for_error(args, path, output_path))
+            results.append(result)
         except Exception as exc:
-            results.append(
-                {
-                    "input_path": str(path),
-                    "status": "error",
-                    "error": str(exc),
-                    "findings": [],
-                    "warnings": [],
-                }
-            )
+            result = result_for(path, None, "error", [], [])
+            result["error"] = safe_error_message(str(exc), *paths_for_error(args, path, output_path))
+            results.append(result)
 
     report = build_report(results, factory, skipped_inputs)
 
-    if args.report:
-        args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    if args.mapping:
-        mapping = factory.sensitive_mapping() if args.export_mapping else factory.safe_mapping()
-        args.mapping.write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        if args.report:
+            args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        if args.mapping:
+            mapping = factory.sensitive_mapping() if args.export_mapping else factory.safe_mapping()
+            args.mapping.write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        print(
+            json.dumps({"error": safe_error_message(str(exc), *argument_paths(args))}, ensure_ascii=False, indent=2),
+            file=sys.stderr,
+        )
+        return 1
 
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return exit_code_for(results, skipped_inputs)
@@ -89,7 +129,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Scan or anonymize sensitive data in text, Markdown, DOCX, and PDF files.",
+        description="Scan or anonymize sensitive data in text, Markdown, DOCX, PDF, and Excel files.",
     )
     parser.add_argument("inputs", nargs="+", type=Path, help="File or directory paths to process.")
     parser.add_argument(
@@ -117,6 +157,22 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Write raw original-to-fake mappings to --mapping. This creates a sensitive artifact.",
     )
     return parser.parse_args(argv)
+
+
+def argument_paths(args: argparse.Namespace) -> list[Path]:
+    paths = list(args.inputs)
+    for attribute in ("output", "output_dir", "report", "terms", "field_rules", "mapping"):
+        value = getattr(args, attribute, None)
+        if value is not None:
+            paths.append(value)
+    return paths
+
+
+def paths_for_error(args: argparse.Namespace, input_path: Path, output_path: Path | None = None) -> list[Path]:
+    paths = [input_path, *argument_paths(args)]
+    if output_path is not None:
+        paths.append(output_path)
+    return paths
 
 
 def resolve_inputs(inputs: list[Path], recursive: bool) -> Iterable[Path]:
@@ -149,7 +205,7 @@ def collect_inputs(inputs: list[Path], recursive: bool) -> tuple[list[Path], lis
 
 
 def skipped_input(path: Path, reason: str, explicit: bool) -> dict:
-    item = {"path": str(path), "reason": reason, "explicit": explicit}
+    item = {"path": safe_report_path(path), "reason": reason, "explicit": explicit}
     if path.suffix:
         item["extension"] = path.suffix.lower()
     return item
@@ -190,6 +246,10 @@ def process_file(
         findings, warnings = anonymize_pdf(path, output_path, custom_terms, field_rules, factory)
         return result_for(path, output_path, "anonymized", findings, warnings)
 
+    if suffix in SUPPORTED_EXCEL_EXTENSIONS:
+        findings, warnings = anonymize_excel(path, output_path, custom_terms, field_rules, factory)
+        return result_for(path, output_path, "anonymized", findings, warnings)
+
     raise ValueError(f"Unsupported file extension: {suffix}")
 
 
@@ -200,6 +260,8 @@ def scan_file(
 ) -> tuple[list[Finding], list[str]]:
     if path.suffix.lower() == ".docx":
         return scan_docx(path, custom_terms, field_rules)
+    if path.suffix.lower() in SUPPORTED_EXCEL_EXTENSIONS:
+        return scan_excel(path, custom_terms, field_rules)
     text, warnings = extract_text(path)
     return detect_sensitive_values(text, custom_terms, field_rules), warnings
 
@@ -398,10 +460,16 @@ def adjacent_field_label_contexts(row, field_rules: list[FieldRule]) -> dict[int
     if not field_rules:
         return contexts
     cells = row.cells
+    cell_texts = [cell.text for cell in cells]
+    cells_are_labels = excel_cells_are_field_labels(cell_texts, field_rules)
     for cell_index in range(len(cells) - 1):
-        label_text = cells[cell_index].text
-        if any(field_rule_matches_label(rule, label_text) for rule in field_rules):
-            contexts.setdefault(cell_index + 1, []).append(label_text)
+        label_text = cell_texts[cell_index]
+        value_text = cell_texts[cell_index + 1]
+        if not adjacent_field_context_applies(cell_index, cell_texts, cells_are_labels):
+            continue
+        if not value_text.strip():
+            continue
+        contexts.setdefault(cell_index + 1, []).append(label_text)
     return contexts
 
 
@@ -412,6 +480,740 @@ def replace_paragraph_text(paragraph, new_text: str) -> None:
         paragraph.runs[0].text = new_text
     else:
         paragraph.add_run(new_text)
+
+
+def anonymize_excel(
+    input_path: Path,
+    output_path: Path,
+    custom_terms: list[tuple[str, str]],
+    field_rules: list[FieldRule],
+    factory: FakeDataFactory,
+) -> tuple[list[Finding], list[str]]:
+    workbook = load_excel_workbook(input_path)
+    all_findings: list[Finding] = []
+    formula_cells: list[str] = []
+    sensitive_formula_cells: list[str] = []
+    sensitive_unwritable_cells: list[str] = []
+    sensitive_unwritable_properties: list[str] = []
+    warnings = [
+        "Excel anonymization covers workbook properties, worksheet titles, string cell values, and hyperlink text in worksheets, including hidden sheets.",
+        "Formula expressions and non-string field-rule values are scanned but not anonymized. Review comments, charts, images, shapes, embedded objects, pivot tables, external links, and macros separately.",
+    ]
+    property_findings, property_unwritable = anonymize_excel_workbook_properties(
+        workbook,
+        custom_terms,
+        field_rules,
+        factory,
+    )
+    all_findings.extend(property_findings)
+    sensitive_unwritable_properties.extend(property_unwritable)
+
+    for sheet_index, worksheet in enumerate(workbook.worksheets, 1):
+        new_title, findings = excel_cell_anonymized_text(worksheet.title, custom_terms, field_rules, [], factory)
+        if findings:
+            all_findings.extend(located_findings(findings, excel_sheet_title_location(sheet_index)))
+            existing_titles = [item.title for item in workbook.worksheets if item is not worksheet]
+            worksheet.title = safe_excel_sheet_title(new_title, existing_titles)
+
+    for sheet_index, worksheet in enumerate(workbook.worksheets, 1):
+        vertical_label_contexts_by_column: dict[int, list[str]] = {}
+        rows = list(worksheet.iter_rows())
+        for row_index, row in enumerate(rows):
+            if excel_row_is_blank(row):
+                vertical_label_contexts_by_column = {}
+                continue
+            cell_texts = [excel_text_value(cell.value) for cell in row]
+            cells_are_labels = excel_cells_are_field_labels(cell_texts, field_rules)
+            next_row = rows[row_index + 1] if row_index + 1 < len(rows) else None
+            header_contexts = excel_column_header_contexts(
+                row,
+                field_rules,
+                cell_texts,
+                cells_are_labels,
+                next_row,
+            )
+            row_is_column_header = bool(header_contexts)
+            label_contexts_by_column = (
+                {}
+                if row_is_column_header
+                else adjacent_excel_label_contexts(row, field_rules, cell_texts, cells_are_labels)
+            )
+            for cell_index, cell in enumerate(row):
+                location = excel_cell_location(sheet_index, cell.coordinate)
+                vertical_contexts = (
+                    []
+                    if row_is_column_header
+                    or excel_cell_is_label_or_header(cell_texts[cell_index], cells_are_labels[cell_index])
+                    else vertical_label_contexts_by_column.get(cell.column, [])
+                )
+                label_contexts = label_contexts_by_column.get(cell.column, []) + vertical_contexts
+                if cell.data_type == "f":
+                    if cell.value:
+                        formula_cells.append(location)
+                        formula_findings = located_findings(
+                            excel_formula_findings(str(cell.value), custom_terms, field_rules, label_contexts),
+                            location,
+                        )
+                        if formula_findings:
+                            all_findings.extend(formula_findings)
+                            sensitive_formula_cells.append(location)
+                else:
+                    text = excel_text_value(cell.value)
+                    if text is not None:
+                        new_text, findings = excel_cell_anonymized_text(
+                            text,
+                            custom_terms,
+                            field_rules,
+                            label_contexts,
+                            factory,
+                        )
+                        if findings:
+                            cell.value = new_text
+                            all_findings.extend(located_findings(findings, location))
+                    else:
+                        detectable_text = excel_non_string_context_text(cell, label_contexts)
+                        if detectable_text is not None:
+                            findings = located_findings(
+                                excel_cell_findings(detectable_text, custom_terms, field_rules, label_contexts),
+                                location,
+                            )
+                            if findings:
+                                all_findings.extend(findings)
+                                sensitive_unwritable_cells.append(location)
+                all_findings.extend(anonymize_excel_hyperlink(cell, custom_terms, field_rules, factory, location))
+            if header_contexts:
+                vertical_label_contexts_by_column = header_contexts
+
+    if formula_cells:
+        warnings.append(
+            "Formula cells were not anonymized and may contain or reveal sensitive values: "
+            + ", ".join(formula_cells[:20])
+            + ("..." if len(formula_cells) > 20 else "")
+        )
+    if sensitive_unwritable_cells:
+        warnings.append(
+            "Non-string Excel cells contain sensitive values that were not anonymized: "
+            + ", ".join(sensitive_unwritable_cells[:20])
+            + ("..." if len(sensitive_unwritable_cells) > 20 else "")
+        )
+    if sensitive_unwritable_properties:
+        warnings.append(
+            "Non-string Excel workbook properties contain sensitive values that were not anonymized: "
+            + ", ".join(sensitive_unwritable_properties[:20])
+            + ("..." if len(sensitive_unwritable_properties) > 20 else "")
+        )
+    blocking_messages = []
+    if sensitive_formula_cells:
+        blocking_messages.append(
+            "Excel formulas contain sensitive values in cells that were not anonymized: "
+            + ", ".join(sensitive_formula_cells[:20])
+            + ("..." if len(sensitive_formula_cells) > 20 else "")
+        )
+    if sensitive_unwritable_cells:
+        blocking_messages.append(
+            "Excel non-string cells contain sensitive values in cells that were not anonymized: "
+            + ", ".join(sensitive_unwritable_cells[:20])
+            + ("..." if len(sensitive_unwritable_cells) > 20 else "")
+        )
+    if sensitive_unwritable_properties:
+        blocking_messages.append(
+            "Excel non-string workbook properties contain sensitive values that were not anonymized: "
+            + ", ".join(sensitive_unwritable_properties[:20])
+            + ("..." if len(sensitive_unwritable_properties) > 20 else "")
+        )
+    if blocking_messages:
+        raise ProcessingError("; ".join(blocking_messages), all_findings, warnings)
+
+    workbook.save(output_path)
+    return all_findings, warnings
+
+
+def scan_excel(
+    input_path: Path,
+    custom_terms: list[tuple[str, str]],
+    field_rules: list[FieldRule],
+) -> tuple[list[Finding], list[str]]:
+    workbook = load_excel_workbook(input_path)
+    all_findings: list[Finding] = []
+    formula_cells: list[str] = []
+    sensitive_formula_cells: list[str] = []
+    sensitive_unwritable_cells: list[str] = []
+    sensitive_unwritable_properties: list[str] = []
+    warnings = [
+        "Excel scan covers workbook properties, worksheet titles, string cell values, formula expressions, and hyperlink text in worksheets, including hidden sheets.",
+        "Review non-string cells outside field-rule contexts, comments, charts, images, shapes, embedded objects, pivot tables, external links, and macros separately.",
+    ]
+    property_findings, property_unwritable = scan_excel_workbook_properties(workbook, custom_terms, field_rules)
+    all_findings.extend(property_findings)
+    sensitive_unwritable_properties.extend(property_unwritable)
+
+    for sheet_index, worksheet in enumerate(workbook.worksheets, 1):
+        all_findings.extend(
+            located_findings(
+                detect_sensitive_values(worksheet.title, custom_terms, field_rules),
+                excel_sheet_title_location(sheet_index),
+            )
+        )
+
+    for sheet_index, worksheet in enumerate(workbook.worksheets, 1):
+        vertical_label_contexts_by_column: dict[int, list[str]] = {}
+        rows = list(worksheet.iter_rows())
+        for row_index, row in enumerate(rows):
+            if excel_row_is_blank(row):
+                vertical_label_contexts_by_column = {}
+                continue
+            cell_texts = [excel_text_value(cell.value) for cell in row]
+            cells_are_labels = excel_cells_are_field_labels(cell_texts, field_rules)
+            next_row = rows[row_index + 1] if row_index + 1 < len(rows) else None
+            header_contexts = excel_column_header_contexts(
+                row,
+                field_rules,
+                cell_texts,
+                cells_are_labels,
+                next_row,
+            )
+            row_is_column_header = bool(header_contexts)
+            label_contexts_by_column = (
+                {}
+                if row_is_column_header
+                else adjacent_excel_label_contexts(row, field_rules, cell_texts, cells_are_labels)
+            )
+            for cell_index, cell in enumerate(row):
+                location = excel_cell_location(sheet_index, cell.coordinate)
+                vertical_contexts = (
+                    []
+                    if row_is_column_header
+                    or excel_cell_is_label_or_header(cell_texts[cell_index], cells_are_labels[cell_index])
+                    else vertical_label_contexts_by_column.get(cell.column, [])
+                )
+                label_contexts = label_contexts_by_column.get(cell.column, []) + vertical_contexts
+                if cell.data_type == "f":
+                    if cell.value:
+                        formula_cells.append(location)
+                        formula_findings = located_findings(
+                            excel_formula_findings(str(cell.value), custom_terms, field_rules, label_contexts),
+                            location,
+                        )
+                        if formula_findings:
+                            all_findings.extend(formula_findings)
+                            sensitive_formula_cells.append(location)
+                else:
+                    text = excel_text_value(cell.value)
+                    if text is not None:
+                        all_findings.extend(
+                            located_findings(
+                                excel_cell_findings(
+                                    text,
+                                    custom_terms,
+                                    field_rules,
+                                    label_contexts,
+                                ),
+                                location,
+                            )
+                        )
+                    else:
+                        detectable_text = excel_non_string_context_text(cell, label_contexts)
+                        if detectable_text is not None:
+                            findings = located_findings(
+                                excel_cell_findings(detectable_text, custom_terms, field_rules, label_contexts),
+                                location,
+                            )
+                            if findings:
+                                all_findings.extend(findings)
+                                sensitive_unwritable_cells.append(location)
+                all_findings.extend(
+                    scan_excel_hyperlink(
+                        cell,
+                        custom_terms,
+                        field_rules,
+                        location,
+                    )
+                )
+            if header_contexts:
+                vertical_label_contexts_by_column = header_contexts
+
+    if formula_cells:
+        warnings.append(
+            "Formula expressions were scanned, but calculated results were not inspected: "
+            + ", ".join(formula_cells[:20])
+            + ("..." if len(formula_cells) > 20 else "")
+        )
+    if sensitive_formula_cells:
+        warnings.append(
+            "Formula cells contain sensitive values and require manual review: "
+            + ", ".join(sensitive_formula_cells[:20])
+            + ("..." if len(sensitive_formula_cells) > 20 else "")
+        )
+    if sensitive_unwritable_cells:
+        warnings.append(
+            "Non-string cells contain sensitive values and require manual review: "
+            + ", ".join(sensitive_unwritable_cells[:20])
+            + ("..." if len(sensitive_unwritable_cells) > 20 else "")
+        )
+    if sensitive_unwritable_properties:
+        warnings.append(
+            "Non-string workbook properties contain sensitive values and require manual review: "
+            + ", ".join(sensitive_unwritable_properties[:20])
+            + ("..." if len(sensitive_unwritable_properties) > 20 else "")
+        )
+
+    return all_findings, warnings
+
+
+def anonymize_excel_workbook_properties(
+    workbook,
+    custom_terms: list[tuple[str, str]],
+    field_rules: list[FieldRule],
+    factory: FakeDataFactory,
+) -> tuple[list[Finding], list[str]]:
+    all_findings: list[Finding] = []
+    unwritable_locations: list[str] = []
+
+    for attribute in EXCEL_WORKBOOK_PROPERTY_ATTRIBUTES:
+        value = getattr(workbook.properties, attribute, None)
+        location = excel_workbook_property_location(attribute)
+        if isinstance(value, str):
+            new_text, findings = excel_cell_anonymized_text(value, custom_terms, field_rules, [], factory)
+            if findings:
+                setattr(workbook.properties, attribute, new_text)
+                all_findings.extend(located_findings(findings, location))
+        elif value is not None:
+            findings = located_findings(excel_cell_findings(str(value), custom_terms, field_rules, []), location)
+            if findings:
+                all_findings.extend(findings)
+                unwritable_locations.append(location)
+
+    custom_properties = getattr(workbook, "custom_doc_props", None)
+    if custom_properties is not None:
+        for index, prop in enumerate(list(custom_properties), 1):
+            name = getattr(prop, "name", None)
+            name_location = excel_custom_property_location(index, "name")
+            if isinstance(name, str):
+                new_name, findings = excel_cell_anonymized_text(name, custom_terms, field_rules, [], factory)
+                if findings:
+                    existing_names = [
+                        getattr(other, "name", "")
+                        for other in custom_properties
+                        if other is not prop and isinstance(getattr(other, "name", None), str)
+                    ]
+                    prop.name = safe_excel_custom_property_name(new_name, existing_names)
+                    all_findings.extend(located_findings(findings, name_location))
+
+            value = getattr(prop, "value", None)
+            value_location = excel_custom_property_location(index, "value")
+            if isinstance(value, str):
+                new_value, findings = excel_cell_anonymized_text(value, custom_terms, field_rules, [], factory)
+                if findings:
+                    prop.value = new_value
+                    all_findings.extend(located_findings(findings, value_location))
+            elif value is not None:
+                findings = located_findings(excel_cell_findings(str(value), custom_terms, field_rules, []), value_location)
+                if findings:
+                    all_findings.extend(findings)
+                    unwritable_locations.append(value_location)
+
+    return all_findings, unwritable_locations
+
+
+def scan_excel_workbook_properties(
+    workbook,
+    custom_terms: list[tuple[str, str]],
+    field_rules: list[FieldRule],
+) -> tuple[list[Finding], list[str]]:
+    all_findings: list[Finding] = []
+    unwritable_locations: list[str] = []
+
+    for attribute in EXCEL_WORKBOOK_PROPERTY_ATTRIBUTES:
+        value = getattr(workbook.properties, attribute, None)
+        location = excel_workbook_property_location(attribute)
+        if isinstance(value, str):
+            all_findings.extend(
+                located_findings(excel_cell_findings(value, custom_terms, field_rules, []), location)
+            )
+        elif value is not None:
+            findings = located_findings(excel_cell_findings(str(value), custom_terms, field_rules, []), location)
+            if findings:
+                all_findings.extend(findings)
+                unwritable_locations.append(location)
+
+    custom_properties = getattr(workbook, "custom_doc_props", None)
+    if custom_properties is not None:
+        for index, prop in enumerate(custom_properties, 1):
+            name = getattr(prop, "name", None)
+            if isinstance(name, str):
+                all_findings.extend(
+                    located_findings(
+                        excel_cell_findings(name, custom_terms, field_rules, []),
+                        excel_custom_property_location(index, "name"),
+                    )
+                )
+            value = getattr(prop, "value", None)
+            value_location = excel_custom_property_location(index, "value")
+            if isinstance(value, str):
+                all_findings.extend(
+                    located_findings(excel_cell_findings(value, custom_terms, field_rules, []), value_location)
+                )
+            elif value is not None:
+                findings = located_findings(excel_cell_findings(str(value), custom_terms, field_rules, []), value_location)
+                if findings:
+                    all_findings.extend(findings)
+                    unwritable_locations.append(value_location)
+
+    return all_findings, unwritable_locations
+
+
+def excel_workbook_property_location(attribute: str) -> str:
+    return f"workbook property {attribute}"
+
+
+def excel_custom_property_location(index: int, part: str) -> str:
+    return f"workbook custom property {index} {part}"
+
+
+def load_excel_workbook(path: Path):
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise RuntimeError("Excel support requires openpyxl. Install with: pip install openpyxl") from exc
+
+    keep_vba = path.suffix.lower() == ".xlsm"
+    return load_workbook(path, data_only=False, keep_vba=keep_vba, rich_text=True)
+
+
+def excel_text_value(value) -> str | None:
+    if isinstance(value, str):
+        return value
+    if value is not None and value.__class__.__name__ == "CellRichText":
+        return str(value)
+    return None
+
+
+def excel_non_string_context_text(cell, label_contexts: list[str]) -> str | None:
+    if not label_contexts or cell.value is None:
+        return None
+    if cell.data_type == "f":
+        return None
+    if excel_text_value(cell.value) is not None:
+        return None
+    return str(cell.value)
+
+
+def excel_cell_location(sheet_index: int, coordinate: str) -> str:
+    return f"sheet {sheet_index}!{coordinate}"
+
+
+def excel_sheet_title_location(sheet_index: int) -> str:
+    return f"sheet {sheet_index} title"
+
+
+def located_findings(findings: list[Finding], location: str) -> list[Finding]:
+    return [
+        Finding(finding.category, finding.value, finding.start, finding.end, finding.source, location)
+        for finding in findings
+    ]
+
+
+def safe_excel_sheet_title(title: str, existing_titles: list[str]) -> str:
+    cleaned = INVALID_EXCEL_SHEET_TITLE_CHARS.sub("_", title).strip("'") or "Sheet"
+    base = cleaned[:31] or "Sheet"
+    existing = {item.lower() for item in existing_titles}
+    candidate = base
+    counter = 1
+    while candidate.lower() in existing:
+        suffix = f" {counter}"
+        candidate = base[: 31 - len(suffix)] + suffix
+        counter += 1
+    return candidate
+
+
+def safe_excel_custom_property_name(name: str, existing_names: list[str]) -> str:
+    base = (name.strip() or "Property")[:255]
+    existing = {item.lower() for item in existing_names}
+    candidate = base
+    counter = 1
+    while candidate.lower() in existing:
+        suffix = f" {counter}"
+        candidate = base[: 255 - len(suffix)] + suffix
+        counter += 1
+    return candidate
+
+
+def excel_cell_anonymized_text(
+    text: str,
+    custom_terms: list[tuple[str, str]],
+    field_rules: list[FieldRule],
+    label_contexts: list[str],
+    factory: FakeDataFactory,
+) -> tuple[str, list[Finding]]:
+    findings = excel_cell_findings(text, custom_terms, field_rules, label_contexts)
+    output = []
+    cursor = 0
+    for finding in non_overlapping(findings):
+        output.append(text[cursor : finding.start])
+        output.append(factory.replacement_for(finding.category, finding.value))
+        cursor = finding.end
+    output.append(text[cursor:])
+    return "".join(output), findings
+
+
+def excel_cell_findings(
+    text: str,
+    custom_terms: list[tuple[str, str]],
+    field_rules: list[FieldRule],
+    label_contexts: list[str],
+) -> list[Finding]:
+    findings = detect_sensitive_values(text, custom_terms, field_rules)
+    for label_context in label_contexts:
+        for finding in detect_field_rule_values(text, field_rules, label_context=label_context):
+            if not any(finding.start < item.end and finding.end > item.start for item in findings):
+                findings.append(finding)
+    return sorted(findings, key=lambda item: (item.start, -(item.end - item.start)))
+
+
+def excel_formula_findings(
+    text: str,
+    custom_terms: list[tuple[str, str]],
+    field_rules: list[FieldRule],
+    label_contexts: list[str],
+) -> list[Finding]:
+    findings = detect_sensitive_values(text, custom_terms, field_rules)
+    for label_context in label_contexts:
+        for literal_text, literal_start in excel_formula_string_literals(text):
+            for finding in detect_field_rule_values(literal_text, field_rules, label_context=label_context):
+                shifted = Finding(
+                    finding.category,
+                    finding.value,
+                    literal_start + finding.start,
+                    literal_start + finding.end,
+                    "formula_field_rules",
+                )
+                if not any(shifted.start < item.end and shifted.end > item.start for item in findings):
+                    findings.append(shifted)
+    return sorted(findings, key=lambda item: (item.start, -(item.end - item.start)))
+
+
+def excel_formula_string_literals(text: str) -> list[tuple[str, int]]:
+    literals: list[tuple[str, int]] = []
+    cursor = 0
+    while cursor < len(text):
+        if text[cursor] != '"':
+            cursor += 1
+            continue
+        literal_start = cursor + 1
+        cursor = literal_start
+        while cursor < len(text):
+            if text[cursor] == '"':
+                if cursor + 1 < len(text) and text[cursor + 1] == '"':
+                    cursor += 2
+                    continue
+                literals.append((text[literal_start:cursor], literal_start))
+                cursor += 1
+                break
+            cursor += 1
+    return literals
+
+
+def adjacent_excel_label_contexts(
+    row,
+    field_rules: list[FieldRule],
+    cell_texts: list[str | None] | None = None,
+    cells_are_labels: list[bool] | None = None,
+) -> dict[int, list[str]]:
+    contexts: dict[int, list[str]] = {}
+    if not field_rules:
+        return contexts
+    cell_texts = cell_texts if cell_texts is not None else [excel_text_value(cell.value) for cell in row]
+    cells_are_labels = cells_are_labels if cells_are_labels is not None else excel_cells_are_field_labels(cell_texts, field_rules)
+    for cell_index in range(len(row) - 1):
+        label = cell_texts[cell_index]
+        value_cell = row[cell_index + 1]
+        value_text = cell_texts[cell_index + 1]
+        if label is None or not adjacent_field_context_applies(cell_index, cell_texts, cells_are_labels):
+            continue
+        if value_cell.value is None:
+            continue
+        if value_text is not None and looks_like_excel_table_header_value(value_text):
+            continue
+        contexts.setdefault(value_cell.column, []).append(label)
+    return contexts
+
+
+def excel_cells_are_field_labels(cell_texts: list[str | None], field_rules: list[FieldRule]) -> list[bool]:
+    if not field_rules:
+        return [False for _text in cell_texts]
+    return [
+        bool(text is not None and any(field_rule_matches_label(rule, text) for rule in field_rules))
+        for text in cell_texts
+    ]
+
+
+def excel_row_is_blank(row) -> bool:
+    return all(cell.value is None and cell.hyperlink is None for cell in row)
+
+
+def excel_column_header_contexts(
+    row,
+    field_rules: list[FieldRule],
+    cell_texts: list[str | None],
+    cells_are_labels: list[bool],
+    next_row=None,
+) -> dict[int, list[str]]:
+    if not field_rules:
+        return {}
+    nonblank_indexes = [
+        index
+        for index, text in enumerate(cell_texts)
+        if text is not None and normalize_excel_label(text)
+    ]
+    label_indexes = [index for index in nonblank_indexes if cells_are_labels[index]]
+    if not nonblank_indexes or not label_indexes:
+        return {}
+
+    row_looks_like_header = (
+        (len(nonblank_indexes) == 1 and excel_row_has_only_value(row, nonblank_indexes[0]))
+        or (
+            len(nonblank_indexes) > 1
+            and all(cells_are_labels[index] or excel_cell_is_header_value(cell_texts[index]) for index in nonblank_indexes)
+        )
+        or excel_next_row_supports_column_headers(
+            row,
+            label_indexes,
+            field_rules,
+            next_row,
+        )
+    )
+    if not row_looks_like_header:
+        return {}
+    return {
+        cell.column: [cell_texts[index]]
+        for index, cell in enumerate(row)
+        if cells_are_labels[index] and cell_texts[index] is not None
+    }
+
+
+def excel_row_has_only_value(row, value_index: int) -> bool:
+    return all(index == value_index or (cell.value is None and cell.hyperlink is None) for index, cell in enumerate(row))
+
+
+def excel_next_row_supports_column_headers(
+    row,
+    label_indexes: list[int],
+    field_rules: list[FieldRule],
+    next_row,
+) -> bool:
+    if next_row is None:
+        return False
+    for index in label_indexes:
+        if index >= len(next_row):
+            continue
+        label_text = excel_text_value(row[index].value)
+        value_text = excel_context_probe_text(next_row[index])
+        if label_text is None or value_text is None:
+            continue
+        if any(field_rule_matches_label(rule, value_text) for rule in field_rules):
+            continue
+        if excel_cell_is_header_value(value_text):
+            continue
+        if excel_field_rule_context_findings(value_text, field_rules, label_text):
+            return True
+    return False
+
+
+def excel_field_rule_context_findings(text: str, field_rules: list[FieldRule], label_context: str) -> list[Finding]:
+    findings: list[Finding] = []
+    for finding in detect_field_rule_values(text, field_rules, label_context=label_context):
+        if not any(finding.start < item.end and finding.end > item.start for item in findings):
+            findings.append(finding)
+    return sorted(findings, key=lambda item: (item.start, -(item.end - item.start)))
+
+
+def excel_context_probe_text(cell) -> str | None:
+    text = excel_text_value(cell.value)
+    if text is not None:
+        return text
+    if cell.value is None or cell.data_type == "f":
+        return None
+    return str(cell.value)
+
+
+def excel_cell_is_label_or_header(text: str | None, is_label: bool) -> bool:
+    return is_label or excel_cell_is_header_value(text)
+
+
+def excel_cell_is_header_value(text: str | None) -> bool:
+    return bool(text is not None and looks_like_excel_table_header_value(text))
+
+
+def looks_like_excel_table_header_value(text: str) -> bool:
+    return normalize_excel_label(text) in EXCEL_TABLE_HEADER_VALUES
+
+
+def normalize_excel_label(text: str) -> str:
+    return re.sub(r"[\s:：；;，,。]", "", text or "")
+
+
+def adjacent_field_context_applies(
+    cell_index: int,
+    cell_texts: list[str | None],
+    cells_are_labels: list[bool],
+) -> bool:
+    if cell_index >= len(cell_texts) - 1:
+        return False
+    label = cell_texts[cell_index]
+    value_text = cell_texts[cell_index + 1]
+    if label is None or not cells_are_labels[cell_index]:
+        return False
+    if cell_index > 0 and cells_are_labels[cell_index - 1]:
+        return False
+    if cells_are_labels[cell_index + 1]:
+        return False
+    return not (value_text is not None and looks_like_excel_table_header_value(value_text))
+
+
+def anonymize_excel_hyperlink(
+    cell,
+    custom_terms: list[tuple[str, str]],
+    field_rules: list[FieldRule],
+    factory: FakeDataFactory,
+    cell_location: str,
+) -> list[Finding]:
+    hyperlink = cell.hyperlink
+    if hyperlink is None:
+        return []
+
+    findings: list[Finding] = []
+    for attribute in EXCEL_HYPERLINK_TEXT_ATTRIBUTES:
+        value = getattr(hyperlink, attribute, None)
+        if not isinstance(value, str):
+            continue
+        new_text, attribute_findings = excel_cell_anonymized_text(value, custom_terms, field_rules, [], factory)
+        if attribute_findings:
+            setattr(hyperlink, attribute, new_text)
+            findings.extend(located_findings(attribute_findings, f"{cell_location} hyperlink {attribute}"))
+    return findings
+
+
+def scan_excel_hyperlink(
+    cell,
+    custom_terms: list[tuple[str, str]],
+    field_rules: list[FieldRule],
+    cell_location: str,
+) -> list[Finding]:
+    hyperlink = cell.hyperlink
+    if hyperlink is None:
+        return []
+
+    findings: list[Finding] = []
+    for attribute in EXCEL_HYPERLINK_TEXT_ATTRIBUTES:
+        value = getattr(hyperlink, attribute, None)
+        if isinstance(value, str):
+            findings.extend(
+                located_findings(
+                    excel_cell_findings(value, custom_terms, field_rules, []),
+                    f"{cell_location} hyperlink {attribute}",
+                )
+            )
+    return findings
 
 
 def anonymize_pdf(
@@ -477,11 +1279,16 @@ def plan_outputs(inputs: list[Path], args: argparse.Namespace) -> dict[Path, Pat
     roots = input_roots(args.inputs)
     for path in inputs:
         output_path = output_for(path, args, roots, len(inputs))
+        validate_output_extension(path, output_path)
         if same_path(path, output_path):
-            raise ValueError(f"Refusing to overwrite original file: {path}")
+            raise ValueError(f"Refusing to overwrite original file: {safe_report_path(path)}")
         resolved_output = output_path.expanduser().resolve(strict=False)
         if resolved_output in seen:
-            raise ValueError(f"Output path collision: {seen[resolved_output]} and {path} both map to {output_path}")
+            raise ValueError(
+                "Output path collision: "
+                + f"{safe_report_path(seen[resolved_output])} and {safe_report_path(path)} "
+                + f"both map to {safe_report_path(output_path)}"
+            )
         seen[resolved_output] = path
         outputs[path] = output_path
     return outputs
@@ -495,6 +1302,16 @@ def output_for(path: Path, args: argparse.Namespace, roots: list[Path], input_co
     if args.output_dir:
         return args.output_dir / relative_output_name(path, roots)
     return path.with_name(anonymized_name(path))
+
+
+def validate_output_extension(input_path: Path, output_path: Path) -> None:
+    input_suffix = input_path.suffix.lower()
+    output_suffix = output_path.suffix.lower()
+    if input_suffix in SUPPORTED_EXCEL_EXTENSIONS and output_suffix != input_suffix:
+        raise ValueError(
+            "Excel output extension must match input extension: "
+            + f"{safe_report_path(input_path)} -> {safe_report_path(output_path)}"
+        )
 
 
 def anonymized_name(path: Path) -> str:
@@ -521,7 +1338,16 @@ def input_roots(inputs: list[Path]) -> list[Path]:
 
 
 def same_path(left: Path, right: Path) -> bool:
-    return left.expanduser().resolve(strict=False) == right.expanduser().resolve(strict=False)
+    left_expanded = left.expanduser()
+    right_expanded = right.expanduser()
+    if left_expanded.resolve(strict=False) == right_expanded.resolve(strict=False):
+        return True
+    try:
+        return left_expanded.samefile(right_expanded)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
 
 
 def result_for(
@@ -537,7 +1363,8 @@ def result_for(
         counts[category] = counts.get(category, 0) + 1
 
     result = {
-        "input_path": str(input_path),
+        "input_path": safe_report_path(input_path),
+        "input_extension": input_path.suffix.lower(),
         "status": status,
         "finding_counts": counts,
         "finding_count": len(findings),
@@ -548,14 +1375,37 @@ def result_for(
                 "start": finding.start,
                 "end": finding.end,
                 "length": len(finding.value),
+                **({"location": finding.location} if finding.location else {}),
             }
             for finding in findings
         ],
         "warnings": warnings,
     }
     if output_path:
-        result["output_path"] = str(output_path)
+        result["output_path"] = safe_report_path(output_path)
+        result["output_extension"] = output_path.suffix.lower()
     return result
+
+
+def safe_report_path(path: Path) -> str:
+    resolved = str(path.expanduser().resolve(strict=False))
+    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:16]
+    suffix = path.suffix.lower()
+    return f"path:{digest}{suffix}"
+
+
+def safe_error_message(message: str, *paths: Path) -> str:
+    sanitized = message
+    for path in paths:
+        safe_path = safe_report_path(path)
+        candidates = {
+            str(path),
+            str(path.expanduser()),
+            str(path.expanduser().resolve(strict=False)),
+        }
+        for candidate in candidates:
+            sanitized = sanitized.replace(candidate, safe_path)
+    return sanitized
 
 
 def build_report(

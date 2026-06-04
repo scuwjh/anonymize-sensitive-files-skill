@@ -26,6 +26,7 @@ From the skill directory:
 ```bash
 python3 scripts/run_anonymize.py input.md
 python3 scripts/run_anonymize.py input.docx --report report.json
+python3 scripts/run_anonymize.py input.xlsx --mode scan
 python3 scripts/run_anonymize.py input.pdf --mode scan
 python3 scripts/run_anonymize.py ./docs --recursive --output-dir ./anonymized
 python3 scripts/run_anonymize.py contract.md --terms sensitive_terms.txt --seed 20260603
@@ -88,18 +89,19 @@ Lines without a category use the generic custom fake-value pool.
 
 The bundled rules in `references/sensitive-field-rules.yaml` apply to all supported file types, not only contracts. They cover common label/value fields such as emergency contacts, finance contacts, recipients, phone/email fields, addresses, bank accounts, bank routing codes, organizations, and common identifiers.
 
-For Markdown and DOCX tables, the CLI also checks adjacent cells: when a cell contains a configured label such as `财务联系人`, `收件人`, or `联行号`, the cell immediately to its right is scanned with that rule. Field labels themselves are preserved; only values are replaced.
+For Markdown, DOCX, and Excel tables, the CLI also checks adjacent cells: when a cell contains a configured label such as `财务联系人`, `收件人`, or `联行号`, the cell immediately to its right is scanned with that rule. Excel also applies field rules to values below header-like rows, such as `A1=姓名`, `A2=某姓名`. Field labels themselves are preserved; only values are replaced. Excel reports use safe coordinates such as `sheet 1!B2` rather than raw worksheet titles.
 
 ## Safety Rules
 
 - Do not overwrite original files.
 - Do not show full original sensitive values in chat unless the user explicitly provided them and needs them referenced.
 - Do not export raw mappings unless the user asks; raw mappings are sensitive artifacts and are written only to `--mapping`, never to stdout or reports.
-- Prefer reports with category counts, locations, and warnings over reports containing original values.
+- Prefer reports with category counts, safe path references, locations, and warnings over reports containing original values or raw file paths.
 - Treat `skipped_inputs` as incomplete processing. Explicit unsupported or missing input paths make the CLI exit non-zero.
+- For Excel, scan workbook properties, worksheet titles, string cells, formula expressions, hyperlink text, and non-string field-rule values. Anonymization rewrites string workbook properties, worksheet titles, string cells, and hyperlink text, but refuses to save output when formula expressions or non-string field-rule values still contain detected sensitive values.
 - For PDF, require true redaction application, not visual black boxes. The bundled CLI uses PyMuPDF redaction annotations and `apply_redactions()`, and fails if detected text cannot be matched to redaction rectangles.
 - For scanned PDFs, images, forms, annotations, comments, tracked changes, footnotes, and text boxes, report the limitation and ask for OCR/manual review when needed.
 
 ## Format Notes
 
-Read `references/supported-formats.md` when processing DOCX/PDF files, when preserving layout matters, or when the report contains warnings.
+Read `references/supported-formats.md` when processing DOCX/Excel/PDF files, when preserving layout matters, or when the report contains warnings.

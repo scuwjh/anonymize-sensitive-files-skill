@@ -13,6 +13,7 @@ class Finding:
     start: int
     end: int
     source: str
+    location: str | None = None
 
 
 @dataclass(frozen=True)

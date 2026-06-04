@@ -4,6 +4,8 @@ import sys
 import tempfile
 import types
 import unittest
+import zipfile
+from copy import copy
 from pathlib import Path
 from unittest.mock import patch
 
@@ -48,7 +50,7 @@ class AnonymizeFilesTest(unittest.TestCase):
             )
 
             payload = json.loads(result.stdout)
-            output = Path(payload["outputs"][0]["output_path"])
+            output = tmp_path / "case.anonymized.md"
             report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
             anonymized = output.read_text(encoding="utf-8")
 
@@ -412,6 +414,40 @@ class AnonymizeFilesTest(unittest.TestCase):
             self.assertNotIn("顾安琪", text)
             self.assertNotIn("313305007918", text)
 
+    def test_docx_adjacent_rules_ignore_neighboring_label_cells(self):
+        try:
+            from docx import Document
+        except ImportError:
+            self.skipTest("python-docx is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "label-row.docx"
+            doc = Document()
+            table = doc.add_table(rows=1, cols=4)
+            for index, value in enumerate(["甲方", "乙方", "签署栏", "盖章"]):
+                table.cell(0, index).text = value
+            doc.save(source)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            payload = json.loads(result.stdout)
+            output = tmp_path / "label-row.anonymized.docx"
+            anonymized_doc = Document(output)
+            cells = [anonymized_doc.tables[0].cell(0, index).text for index in range(4)]
+
+            self.assertEqual(payload["summary"]["total_findings"], 0)
+            self.assertEqual(cells, ["甲方", "乙方", "签署栏", "盖章"])
+
     def test_docx_adjacent_phone_label_uses_phone_replacement_for_landline(self):
         try:
             from docx import Document
@@ -442,6 +478,814 @@ class AnonymizeFilesTest(unittest.TestCase):
             anonymized_doc = Document(output)
             self.assertEqual(anonymized_doc.tables[0].cell(0, 1).text, "19999999999")
 
+    def test_xlsx_anonymizes_cells_and_adjacent_field_values(self):
+        try:
+            from openpyxl import Workbook, load_workbook
+        except ImportError:
+            self.skipTest("openpyxl is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "customers.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "客户"
+            sheet["A1"] = "姓名"
+            sheet["B1"] = "李雷"
+            sheet["A2"] = "手机号"
+            sheet["B2"] = "13812345678"
+            sheet["A3"] = "邮箱：lilei@example.com"
+            sheet["A4"] = "=SUM(1, 2)"
+            sheet["A5"] = 13812345678
+            font = copy(sheet["A1"].font)
+            font.bold = True
+            sheet["A1"].font = font
+            workbook.create_sheet("隐藏")
+            workbook["隐藏"]["A1"] = "联系人：李雷"
+            workbook["隐藏"].sheet_state = "hidden"
+            workbook.save(source)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    "--seed",
+                    "xlsx",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            payload = json.loads(result.stdout)
+            output = tmp_path / "customers.anonymized.xlsx"
+            anonymized = load_workbook(output, data_only=False)
+            sheet = anonymized["客户"]
+            hidden = anonymized["隐藏"]
+
+            self.assertTrue(output.exists())
+            self.assertEqual(payload["summary"]["finding_counts"], {"name": 2, "phone": 1, "email": 1})
+            self.assertEqual(sheet["A1"].value, "姓名")
+            self.assertEqual(sheet["B1"].value, "张三")
+            self.assertEqual(sheet["B2"].value, "19999999999")
+            self.assertNotIn("lilei@example.com", sheet["A3"].value)
+            self.assertEqual(sheet["A4"].value, "=SUM(1, 2)")
+            self.assertEqual(sheet["A5"].value, 13812345678)
+            self.assertTrue(sheet["A1"].font.bold)
+            self.assertEqual(hidden.sheet_state, "hidden")
+            self.assertEqual(hidden["A1"].value, "联系人：张三")
+            self.assertTrue(any("Formula cells" in warning for warning in payload["outputs"][0]["warnings"]))
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(output),
+                    "--mode",
+                    "verify",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(verify.stdout)["outputs"][0]["status"], "verified")
+
+    def test_xlsx_mixed_column_headers_anonymize_values_without_rewriting_headers(self):
+        try:
+            from openpyxl import Workbook, load_workbook
+        except ImportError:
+            self.skipTest("openpyxl is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "mixed-headers.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["姓名", "部门", "手机号"])
+            sheet.append(["李雷", "销售", "13812345678"])
+            workbook.save(source)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            payload = json.loads(result.stdout)
+            output = tmp_path / "mixed-headers.anonymized.xlsx"
+            anonymized = load_workbook(output)
+            rows = list(anonymized.active.iter_rows(values_only=True))
+            locations = {finding["location"] for finding in payload["outputs"][0]["findings"]}
+
+            self.assertEqual(payload["summary"]["finding_counts"], {"name": 1, "phone": 1})
+            self.assertEqual(rows[0], ("姓名", "部门", "手机号"))
+            self.assertEqual(rows[1], ("张三", "销售", "19999999999"))
+            self.assertIn("sheet 1!A2", locations)
+            self.assertIn("sheet 1!C2", locations)
+            self.assertNotIn("sheet 1!B1", locations)
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(output),
+                    "--mode",
+                    "verify",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(verify.stdout)["outputs"][0]["status"], "verified")
+
+    def test_xlsx_adjacent_numeric_values_are_reported_and_block_anonymize(self):
+        try:
+            from openpyxl import Workbook
+        except ImportError:
+            self.skipTest("openpyxl is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "numeric-phone.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet["A1"] = "手机号"
+            sheet["B1"] = 13812345678
+            workbook.save(source)
+
+            scan = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    "--mode",
+                    "scan",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(scan.stdout)["summary"]["finding_counts"], {"phone": 1})
+
+            anonymize = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            payload = json.loads(anonymize.stdout)
+            combined_output = anonymize.stdout + anonymize.stderr
+            self.assertNotEqual(anonymize.returncode, 0)
+            self.assertEqual(payload["outputs"][0]["status"], "error")
+            self.assertEqual(payload["summary"]["finding_counts"], {"phone": 1})
+            self.assertFalse((tmp_path / "numeric-phone.anonymized.xlsx").exists())
+            self.assertNotIn("13812345678", combined_output)
+            self.assertIn("sheet 1!B1", combined_output)
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    "--mode",
+                    "verify",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            verify_payload = json.loads(verify.stdout)
+            self.assertNotEqual(verify.returncode, 0)
+            self.assertEqual(verify_payload["outputs"][0]["status"], "residual_findings")
+            self.assertEqual(verify_payload["summary"]["finding_counts"], {"phone": 1})
+
+    def test_xlsx_adjacent_formula_string_values_are_reported_and_block_anonymize(self):
+        try:
+            from openpyxl import Workbook
+        except ImportError:
+            self.skipTest("openpyxl is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "formula-name.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet["A1"] = "收件人"
+            sheet["B1"] = '="沈亦然"'
+            workbook.save(source)
+
+            scan = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    "--mode",
+                    "scan",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(scan.stdout)["summary"]["finding_counts"], {"name": 1})
+
+            anonymize = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            payload = json.loads(anonymize.stdout)
+            combined_output = anonymize.stdout + anonymize.stderr
+            self.assertNotEqual(anonymize.returncode, 0)
+            self.assertEqual(payload["outputs"][0]["status"], "error")
+            self.assertEqual(payload["summary"]["finding_counts"], {"name": 1})
+            self.assertFalse((tmp_path / "formula-name.anonymized.xlsx").exists())
+            self.assertNotIn("沈亦然", combined_output)
+            self.assertIn("sheet 1!B1", combined_output)
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    "--mode",
+                    "verify",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            verify_payload = json.loads(verify.stdout)
+            self.assertNotEqual(verify.returncode, 0)
+            self.assertEqual(verify_payload["outputs"][0]["status"], "residual_findings")
+            self.assertEqual(verify_payload["summary"]["finding_counts"], {"name": 1})
+
+    def test_xlsx_anonymizes_sheet_titles_without_leaking_them_in_warnings(self):
+        try:
+            from openpyxl import Workbook, load_workbook
+        except ImportError:
+            self.skipTest("openpyxl is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "sheet-title.xlsx"
+            terms = tmp_path / "terms.txt"
+            terms.write_text("name:李雷\n", encoding="utf-8")
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "李雷13812345678"
+            sheet["A1"] = "=SUM(1, 2)"
+            sheet["A2"] = "姓名"
+            sheet["B2"] = "李雷"
+            workbook.save(source)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    "--terms",
+                    str(terms),
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            payload = json.loads(result.stdout)
+            report_text = json.dumps(payload, ensure_ascii=False)
+            output = tmp_path / "sheet-title.anonymized.xlsx"
+            anonymized = load_workbook(output, data_only=False)
+
+            self.assertNotIn("李雷", report_text)
+            self.assertNotIn("13812345678", report_text)
+            self.assertNotIn("李雷", "".join(anonymized.sheetnames))
+            self.assertNotIn("13812345678", "".join(anonymized.sheetnames))
+            self.assertTrue(any("sheet 1!A1" in warning for warning in payload["outputs"][0]["warnings"]))
+
+    def test_xlsx_anonymize_fails_without_output_when_formula_contains_sensitive_value(self):
+        try:
+            from openpyxl import Workbook
+        except ImportError:
+            self.skipTest("openpyxl is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "formula.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet["A1"] = '=CONCAT("李雷", "13812345678")'
+            workbook.save(source)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            payload = json.loads(result.stdout)
+            output = tmp_path / "formula.anonymized.xlsx"
+            combined_output = result.stdout + result.stderr
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(payload["outputs"][0]["status"], "error")
+            self.assertEqual(payload["summary"]["finding_counts"], {"phone": 1})
+            self.assertFalse(output.exists())
+            self.assertNotIn("李雷", combined_output)
+            self.assertNotIn("13812345678", combined_output)
+            self.assertIn("sheet 1!A1", combined_output)
+
+    def test_xlsx_verify_reports_residual_sensitive_formula(self):
+        try:
+            from openpyxl import Workbook
+        except ImportError:
+            self.skipTest("openpyxl is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "formula-residual.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet["A1"] = '=CONCAT("李雷", "13812345678")'
+            workbook.save(source)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    "--mode",
+                    "verify",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            payload = json.loads(result.stdout)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(payload["outputs"][0]["status"], "residual_findings")
+            self.assertEqual(payload["summary"]["finding_counts"], {"phone": 1})
+            self.assertNotIn("李雷", result.stdout)
+            self.assertNotIn("13812345678", result.stdout)
+
+    def test_xlsx_anonymizes_hyperlink_targets_without_raw_residue(self):
+        try:
+            from openpyxl import Workbook, load_workbook
+        except ImportError:
+            self.skipTest("openpyxl is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "hyperlink.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet["A1"] = "邮箱：lilei@example.com"
+            sheet["A1"].hyperlink = "mailto:lilei@example.com"
+            sheet["A1"].style = "Hyperlink"
+            workbook.save(source)
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            output = tmp_path / "hyperlink.anonymized.xlsx"
+            anonymized = load_workbook(output)
+            target = anonymized.active["A1"].hyperlink.target
+            with zipfile.ZipFile(output) as package:
+                package_text = "\n".join(
+                    package.read(name).decode("utf-8", errors="ignore") for name in package.namelist()
+                )
+
+            self.assertNotIn("lilei@example.com", anonymized.active["A1"].value)
+            self.assertNotIn("lilei@example.com", target)
+            self.assertNotIn("lilei@example.com", package_text)
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(output),
+                    "--mode",
+                    "verify",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(verify.stdout)["outputs"][0]["status"], "verified")
+
+    def test_xlsx_adjacent_rules_ignore_neighboring_label_cells(self):
+        try:
+            from openpyxl import Workbook, load_workbook
+        except ImportError:
+            self.skipTest("openpyxl is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "labels.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["甲方", "乙方", "签署栏", "盖章"])
+            sheet.append(["字段", "值", "字段", "值"])
+            workbook.save(source)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            payload = json.loads(result.stdout)
+            output = tmp_path / "labels.anonymized.xlsx"
+            anonymized = load_workbook(output)
+            rows = list(anonymized.active.iter_rows(values_only=True))
+
+            self.assertEqual(payload["summary"]["total_findings"], 0)
+            self.assertEqual(rows[0], ("甲方", "乙方", "签署栏", "盖章"))
+            self.assertEqual(rows[1], ("字段", "值", "字段", "值"))
+
+    def test_xlsx_column_header_values_are_scanned_and_anonymized(self):
+        try:
+            from openpyxl import Workbook, load_workbook
+        except ImportError:
+            self.skipTest("openpyxl is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "column-name.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet["A1"] = "姓名"
+            sheet["A2"] = "李雷"
+            workbook.save(source)
+
+            scan = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    "--mode",
+                    "scan",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(scan.stdout)["summary"]["finding_counts"], {"name": 1})
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            output = tmp_path / "column-name.anonymized.xlsx"
+            anonymized = load_workbook(output)
+            self.assertEqual(anonymized.active["A1"].value, "姓名")
+            self.assertEqual(anonymized.active["A2"].value, "张三")
+
+    def test_xlsx_column_header_numeric_values_are_reported_and_block_anonymize(self):
+        try:
+            from openpyxl import Workbook
+        except ImportError:
+            self.skipTest("openpyxl is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "column-phone.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet["A1"] = "手机号"
+            sheet["A2"] = 13812345678
+            workbook.save(source)
+
+            scan = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    "--mode",
+                    "scan",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(scan.stdout)["summary"]["finding_counts"], {"phone": 1})
+
+            anonymize = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            payload = json.loads(anonymize.stdout)
+            combined_output = anonymize.stdout + anonymize.stderr
+            self.assertNotEqual(anonymize.returncode, 0)
+            self.assertEqual(payload["outputs"][0]["status"], "error")
+            self.assertEqual(payload["summary"]["finding_counts"], {"phone": 1})
+            self.assertFalse((tmp_path / "column-phone.anonymized.xlsx").exists())
+            self.assertNotIn("13812345678", combined_output)
+            self.assertIn("sheet 1!A2", combined_output)
+
+    def test_xlsx_anonymizes_workbook_properties_and_verify_scans_them(self):
+        try:
+            from openpyxl import Workbook, load_workbook
+        except ImportError:
+            self.skipTest("openpyxl is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "metadata.xlsx"
+            terms = tmp_path / "terms.txt"
+            terms.write_text("name:李雷\norg:星河集团\n", encoding="utf-8")
+            workbook = Workbook()
+            workbook.properties.creator = "李雷"
+            workbook.properties.title = "星河集团客户资料 13812345678"
+            workbook.active["A1"] = "普通内容"
+            workbook.save(source)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    "--terms",
+                    str(terms),
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            payload = json.loads(result.stdout)
+            output = tmp_path / "metadata.anonymized.xlsx"
+            anonymized = load_workbook(output)
+            properties_text = "\n".join(
+                str(value or "")
+                for value in [
+                    anonymized.properties.creator,
+                    anonymized.properties.title,
+                    anonymized.properties.subject,
+                    anonymized.properties.description,
+                    anonymized.properties.keywords,
+                    anonymized.properties.category,
+                    anonymized.properties.contentStatus,
+                    anonymized.properties.lastModifiedBy,
+                ]
+            )
+
+            self.assertEqual(payload["summary"]["finding_counts"], {"name": 1, "phone": 1, "org": 1})
+            self.assertNotIn("李雷", properties_text)
+            self.assertNotIn("星河集团", properties_text)
+            self.assertNotIn("13812345678", properties_text)
+
+            verify = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(output),
+                    "--mode",
+                    "verify",
+                    "--terms",
+                    str(terms),
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertEqual(json.loads(verify.stdout)["outputs"][0]["status"], "verified")
+
+    def test_xlsx_preserves_rich_text_cells_without_findings(self):
+        try:
+            from openpyxl import Workbook, load_workbook
+            from openpyxl.cell.rich_text import CellRichText, TextBlock
+            from openpyxl.cell.text import InlineFont
+        except ImportError:
+            self.skipTest("openpyxl rich text support is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "rich-text.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet["A1"] = CellRichText(TextBlock(InlineFont(b=True), "普通"), "说明")
+            workbook.save(source)
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            output = tmp_path / "rich-text.anonymized.xlsx"
+            anonymized = load_workbook(output, rich_text=True)
+            value = anonymized.active["A1"].value
+
+            self.assertIsInstance(value, CellRichText)
+            self.assertIsInstance(value[0], TextBlock)
+            self.assertTrue(value[0].font.b)
+
+    def test_xlsm_preserves_vba_project_part(self):
+        try:
+            from openpyxl import Workbook
+        except ImportError:
+            self.skipTest("openpyxl is not installed")
+
+        def add_vba_project(workbook_path: Path) -> None:
+            with zipfile.ZipFile(workbook_path, "r") as package:
+                entries = {
+                    item.filename: package.read(item.filename)
+                    for item in package.infolist()
+                    if item.filename not in {"[Content_Types].xml", "xl/_rels/workbook.xml.rels", "xl/vbaProject.bin"}
+                }
+                content_types = package.read("[Content_Types].xml").decode("utf-8")
+                if "vbaProject.bin" not in content_types:
+                    content_types = content_types.replace(
+                        "</Types>",
+                        '<Override PartName="/xl/vbaProject.bin" '
+                        'ContentType="application/vnd.ms-office.vbaProject"/></Types>',
+                    )
+                rels = package.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+                if "vbaProject" not in rels:
+                    rels = rels.replace(
+                        "</Relationships>",
+                        '<Relationship Id="rIdVBA" '
+                        'Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" '
+                        'Target="vbaProject.bin"/></Relationships>',
+                    )
+            with zipfile.ZipFile(workbook_path, "w") as package:
+                for name, content in entries.items():
+                    package.writestr(name, content)
+                package.writestr("[Content_Types].xml", content_types)
+                package.writestr("xl/_rels/workbook.xml.rels", rels)
+                package.writestr("xl/vbaProject.bin", b"fake-vba-project")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "macro.xlsm"
+            workbook = Workbook()
+            workbook.active["A1"] = "电话：13812345678"
+            workbook.save(source)
+            add_vba_project(source)
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            output = tmp_path / "macro.anonymized.xlsm"
+            with zipfile.ZipFile(output) as package:
+                self.assertEqual(package.read("xl/vbaProject.bin"), b"fake-vba-project")
+                content_types = package.read("[Content_Types].xml").decode("utf-8")
+                rels = package.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+
+            self.assertIn("vbaProject", content_types)
+            self.assertIn("macroEnabled", content_types)
+            self.assertIn("vbaProject", rels)
+
+    def test_xlsm_output_extension_must_remain_xlsm(self):
+        try:
+            from openpyxl import Workbook
+        except ImportError:
+            self.skipTest("openpyxl is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "macro.xlsm"
+            output = tmp_path / "macro.xlsx"
+            workbook = Workbook()
+            workbook.active["A1"] = "电话：13812345678"
+            workbook.save(source)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    "--output",
+                    str(output),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(output.exists())
+            self.assertIn("Excel output extension", result.stderr + result.stdout)
+
+    def test_xls_is_reported_as_unsupported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "legacy.xls"
+            source.write_bytes(b"not a real workbook")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    "--mode",
+                    "scan",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            payload = json.loads(result.stderr)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(payload["skipped_inputs"][0]["reason"], "unsupported_extension")
+            self.assertEqual(payload["skipped_inputs"][0]["extension"], ".xls")
+
+    def test_report_paths_are_sanitized_by_default(self):
+        try:
+            from openpyxl import Workbook
+        except ImportError:
+            self.skipTest("openpyxl is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "李雷-客户资料.xlsx"
+            workbook = Workbook()
+            workbook.active["A1"] = "普通内容"
+            workbook.save(source)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    "--mode",
+                    "scan",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            payload = json.loads(result.stdout)
+            report_text = json.dumps(payload, ensure_ascii=False)
+            self.assertNotIn("李雷", report_text)
+            self.assertNotIn("客户资料", report_text)
+            self.assertNotEqual(payload["outputs"][0]["input_path"], str(source))
+            self.assertEqual(payload["outputs"][0]["input_extension"], ".xlsx")
+
     def test_mapping_file_hashes_originals_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -470,7 +1314,7 @@ class AnonymizeFilesTest(unittest.TestCase):
     def test_output_cannot_overwrite_original_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            source = tmp_path / "note.txt"
+            source = tmp_path / "李雷-note.txt"
             original = "电话：13812345678\n"
             source.write_text(original, encoding="utf-8")
 
@@ -489,6 +1333,98 @@ class AnonymizeFilesTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(source.read_text(encoding="utf-8"), original)
             self.assertIn("overwrite", result.stderr + result.stdout)
+            self.assertNotIn("李雷", result.stderr + result.stdout)
+
+    def test_output_cannot_overwrite_original_file_through_hardlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "source.txt"
+            output = tmp_path / "output.txt"
+            original = "电话：13812345678\n"
+            source.write_text(original, encoding="utf-8")
+            output.hardlink_to(source)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    "--output",
+                    str(output),
+                ],
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(source.read_text(encoding="utf-8"), original)
+            self.assertEqual(output.read_text(encoding="utf-8"), original)
+            self.assertIn("overwrite", result.stderr + result.stdout)
+
+    def test_output_path_is_sanitized_in_runtime_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "note.txt"
+            output = tmp_path / "李雷-output.txt"
+            source.write_text("电话：13812345678\n", encoding="utf-8")
+            output.mkdir()
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    "--output",
+                    str(output),
+                ],
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("李雷-output", result.stdout + result.stderr)
+            self.assertIn("path:", result.stdout + result.stderr)
+
+    def test_terms_and_field_rules_path_errors_are_sanitized_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "note.txt"
+            source.write_text("电话：13812345678\n", encoding="utf-8")
+
+            terms_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    "--terms",
+                    str(tmp_path / "李雷-terms.txt"),
+                    "--mode",
+                    "scan",
+                ],
+                text=True,
+                capture_output=True,
+            )
+            field_rules_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    "--field-rules",
+                    str(tmp_path / "星河-rules.yaml"),
+                    "--mode",
+                    "scan",
+                ],
+                text=True,
+                capture_output=True,
+            )
+
+            for result in (terms_result, field_rules_result):
+                self.assertNotEqual(result.returncode, 0)
+                payload = json.loads(result.stderr)
+                self.assertIn("error", payload)
+                self.assertNotIn("李雷", result.stdout + result.stderr)
+                self.assertNotIn("星河", result.stdout + result.stderr)
+                self.assertIn("path:", result.stdout + result.stderr)
 
     def test_output_dir_preserves_relative_paths_for_duplicate_names(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -515,15 +1451,9 @@ class AnonymizeFilesTest(unittest.TestCase):
                 check=True,
             )
 
-            payload = json.loads(result.stdout)
-            outputs = {Path(item["output_path"]) for item in payload["outputs"]}
-            self.assertEqual(
-                outputs,
-                {
-                    output_dir / "north" / "case.anonymized.txt",
-                    output_dir / "south" / "case.anonymized.txt",
-                },
-            )
+            json.loads(result.stdout)
+            self.assertTrue((output_dir / "north" / "case.anonymized.txt").exists())
+            self.assertTrue((output_dir / "south" / "case.anonymized.txt").exists())
             self.assertIn("19999999999", (output_dir / "north" / "case.anonymized.txt").read_text(encoding="utf-8"))
             self.assertIn("18888888888", (output_dir / "south" / "case.anonymized.txt").read_text(encoding="utf-8"))
 
@@ -696,7 +1626,8 @@ class AnonymizeFilesTest(unittest.TestCase):
 
             payload = json.loads(result.stdout)
             self.assertEqual(payload["summary"]["skipped_unsupported"], 1)
-            self.assertEqual(payload["skipped_inputs"][0]["path"], str(unsupported))
+            self.assertNotEqual(payload["skipped_inputs"][0]["path"], str(unsupported))
+            self.assertEqual(payload["skipped_inputs"][0]["extension"], ".doc")
             self.assertEqual(payload["skipped_inputs"][0]["reason"], "unsupported_extension")
 
     def test_explicit_unsupported_input_returns_nonzero_and_reports_skip(self):
