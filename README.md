@@ -63,6 +63,35 @@ skills/anonymize-sensitive-files/
 
 `skills/anonymize-sensitive-files/` 是实际 skill 目录。支持从 GitHub repo path 安装 skill 的平台，可以指向这个目录。
 
+## 安装
+
+通过 `npx skills` 安装到 Codex：
+
+```bash
+npx --yes skills add zongzack/anonymize-sensitive-files-skill \
+  --skill anonymize-sensitive-files \
+  --agent codex \
+  -g
+```
+
+安装到所有支持的 agent：
+
+```bash
+npx --yes skills add zongzack/anonymize-sensitive-files-skill --all
+```
+
+只生成一次性使用提示、不安装：
+
+```bash
+npx --yes skills use zongzack/anonymize-sensitive-files-skill@anonymize-sensitive-files
+```
+
+如需先确认仓库内可用的 skill：
+
+```bash
+npx --yes skills add zongzack/anonymize-sensitive-files-skill -l
+```
+
 ## 快速开始
 
 进入 skill 目录：
