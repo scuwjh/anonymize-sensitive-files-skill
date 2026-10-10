@@ -4,6 +4,9 @@ __pycache__/
 .venv/
 venv/
 
+# Exam fixtures and their derived artifacts hold real client data; never commit.
+exams/
+
 # Local anonymization outputs and sensitive artifacts.
 *.anonymized.*
 *.scan.json

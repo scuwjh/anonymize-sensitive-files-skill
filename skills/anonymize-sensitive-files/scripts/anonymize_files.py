@@ -24,6 +24,31 @@ from fake_data import KNOWN_FAKE_VALUES, FakeDataFactory, normalize_category
 SUPPORTED_TEXT_EXTENSIONS = {".md", ".markdown", ".txt", ".text", ".csv", ".tsv", ".json", ".yaml", ".yml"}
 SUPPORTED_EXCEL_EXTENSIONS = {".xlsx", ".xlsm"}
 SUPPORTED_EXTENSIONS = SUPPORTED_TEXT_EXTENSIONS | {".docx", ".pdf"} | SUPPORTED_EXCEL_EXTENSIONS
+DOCX_METADATA_FIELDS = (
+    "author",
+    "last_modified_by",
+    "title",
+    "subject",
+    "comments",
+    "keywords",
+    "category",
+)
+DOCX_PART_NAMES = (
+    "header",
+    "footer",
+    "first_page_header",
+    "first_page_footer",
+    "even_page_header",
+    "even_page_footer",
+)
+STRUCTURED_CATEGORIES = frozenset(
+    {"phone", "email", "id_card", "passport", "bank_card", "bank_routing_code", "social_credit_code", "ip", "url", "domain", "secret"}
+)
+FAKE_VALUE_PATTERN = re.compile(
+    "|".join(sorted((re.escape(value) for value in KNOWN_FAKE_VALUES if len(value) >= 2), key=len, reverse=True))
+)
+
+PDF_METADATA_FIELDS = ("title", "author", "subject", "keywords", "creator")
 EXCEL_HYPERLINK_TEXT_ATTRIBUTES = ("target", "location", "display", "tooltip")
 EXCEL_WORKBOOK_PROPERTY_ATTRIBUTES = (
     "creator",
@@ -78,12 +103,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     try:
-        output_paths = plan_outputs(inputs, args)
-    except ValueError as exc:
-        print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
-        return 2
-
-    try:
         custom_terms = load_custom_terms(args.terms)
         field_rules = load_field_rules(args.field_rules, use_default=not args.no_field_rules)
     except Exception as exc:
@@ -93,6 +112,13 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     factory = FakeDataFactory(seed=args.seed)
+    factory.reserve(value for _, value in custom_terms)
+
+    try:
+        output_paths = plan_outputs(inputs, args, custom_terms, field_rules, factory)
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 2
     results = []
 
     for path in inputs:
@@ -149,6 +175,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="YAML file containing global label/value field rules. Defaults to the bundled rules.",
     )
     parser.add_argument("--no-field-rules", action="store_true", help="Disable bundled and explicit field rules.")
+    parser.add_argument(
+        "--anonymize-filenames",
+        action="store_true",
+        help="Anonymize output file names with the same mapping so file names cannot leak entities.",
+    )
     parser.add_argument("--seed", help="Optional seed label used for stable safe mapping hashes.")
     parser.add_argument("--mapping", type=Path, help="Optional mapping output path. Required with --export-mapping.")
     parser.add_argument(
@@ -183,6 +214,11 @@ def resolve_inputs(inputs: list[Path], recursive: bool) -> Iterable[Path]:
 def collect_inputs(inputs: list[Path], recursive: bool) -> tuple[list[Path], list[dict]]:
     supported: list[Path] = []
     skipped: list[dict] = []
+    # Fake values are assigned in first-appearance order, and output collisions are
+    # resolved in traversal order, so the input sequence is part of the reproducibility
+    # contract. Directory walks follow filesystem order, which changes when a corpus is
+    # copied or re-extracted; normalize every collected path by sorted string order.
+    unordered: list[Path] = []
     for item in inputs:
         item = item.expanduser()
         if item.is_dir():
@@ -191,16 +227,23 @@ def collect_inputs(inputs: list[Path], recursive: bool) -> tuple[list[Path], lis
                 if not child.is_file():
                     continue
                 if child.suffix.lower() in SUPPORTED_EXTENSIONS:
-                    supported.append(child)
+                    unordered.append(child)
                 else:
                     skipped.append(skipped_input(child, "unsupported_extension", explicit=False))
         elif item.is_file():
             if item.suffix.lower() in SUPPORTED_EXTENSIONS:
-                supported.append(item)
+                unordered.append(item)
             else:
                 skipped.append(skipped_input(item, "unsupported_extension", explicit=True))
         else:
             skipped.append(skipped_input(item, "missing", explicit=True))
+    seen_paths: set[str] = set()
+    for path in sorted(unordered, key=str):
+        key = str(path.expanduser())
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        supported.append(path)
     return supported, skipped
 
 
@@ -272,7 +315,7 @@ def verify_file(
     field_rules: list[FieldRule],
 ) -> tuple[list[Finding], list[str]]:
     findings, warnings = scan_file(path, custom_terms, field_rules)
-    return verify_findings(findings), warnings
+    return verify_findings(findings, custom_terms, field_rules), warnings
 
 
 def extract_text(path: Path) -> tuple[str, list[str]]:
@@ -292,7 +335,15 @@ def extract_text(path: Path) -> tuple[str, list[str]]:
             for row in table.rows:
                 for cell in row.cells:
                     parts.append(cell.text)
-        return "\n".join(parts), ["DOCX scan covers paragraphs and tables; headers, footers, comments, and text boxes may need manual review."]
+        for paragraph in iter_docx_part_paragraphs(doc):
+            parts.append(paragraph.text)
+        for attribute in DOCX_METADATA_FIELDS:
+            value = docx_metadata_value(doc, attribute)
+            if value:
+                parts.append(value)
+        return "\n".join(parts), [
+            "DOCX scan covers paragraphs, tables, headers, footers, and core properties; comments, text boxes, and tracked changes may need manual review.",
+        ]
     if suffix == ".pdf":
         try:
             import fitz
@@ -300,11 +351,15 @@ def extract_text(path: Path) -> tuple[str, list[str]]:
             raise RuntimeError("PDF support requires PyMuPDF. Install with: pip install pymupdf") from exc
         doc = fitz.open(path)
         text = "\n".join(page.get_text("text") for page in doc)
+        metadata_text = "\n".join(
+            str(doc.metadata.get(field, "") or "") for field in PDF_METADATA_FIELDS
+        )
+        text = "\n".join(part for part in (metadata_text, text) if part)
         warnings = []
         if not text.strip():
             warnings.append("No PDF text layer found. Use OCR or manual review for scanned pages and image-only content.")
         else:
-            warnings.append("PDF scan covers extractable text; images and annotations may need manual review.")
+            warnings.append("PDF scan covers extractable text and document metadata; images and annotations may need manual review.")
         return text, warnings
     raise ValueError(f"Unsupported file extension: {suffix}")
 
@@ -326,12 +381,41 @@ def anonymize_text(
     return "".join(output), findings
 
 
-def verify_findings(findings: list[Finding]) -> list[Finding]:
-    return [
-        finding
-        for finding in findings
-        if finding.source == "custom_terms" or finding.value not in KNOWN_FAKE_VALUES
-    ]
+def verify_findings(
+    findings: list[Finding],
+    custom_terms: list[tuple[str, str]] | None = None,
+    field_rules: list[FieldRule] | None = None,
+) -> list[Finding]:
+    kept: list[Finding] = []
+    for finding in findings:
+        if finding.source == "custom_terms":
+            kept.append(finding)
+            continue
+        if finding.value in KNOWN_FAKE_VALUES:
+            continue
+        if not _still_sensitive_after_fake_removal(finding.value, custom_terms, field_rules):
+            continue
+        kept.append(finding)
+    return kept
+
+
+def _still_sensitive_after_fake_removal(
+    text: str,
+    custom_terms: list[tuple[str, str]] | None,
+    field_rules: list[FieldRule] | None,
+) -> bool:
+    remainder = FAKE_VALUE_PATTERN.sub("", text)
+    if remainder == text:
+        return True
+    stripped = remainder.strip(" \t\n、，,（）()：:;；。.-－_")
+    if any(value and value in stripped for _, value in custom_terms or []):
+        return True
+    if not stripped:
+        return False
+    return any(
+        finding.category in STRUCTURED_CATEGORIES
+        for finding in detect_sensitive_values(stripped, custom_terms, field_rules)
+    )
 
 
 def non_overlapping(findings: list[Finding]) -> list[Finding]:
@@ -342,6 +426,87 @@ def non_overlapping(findings: list[Finding]) -> list[Finding]:
             selected.append(finding)
             occupied_until = finding.end
     return selected
+
+
+NESTED_RUN_PARENTS = ("w:hyperlink", "w:sdtContent", "w:smartTag", "w:ins", "w:del", "w:fldSimple")
+FIELD_MARKERS = ("w:fldChar", "w:instrText")
+TEXT_CHILD_TAGS = ("w:t", "w:tab", "w:br", "w:noBreakHyphen")
+
+
+def iter_paragraph_runs(paragraph) -> list:
+    """Return the writable runs of a paragraph, including runs nested in hyperlinks and field results.
+
+    ``paragraph.runs`` only exposes direct ``w:r`` children, so cached table-of-contents entries and
+    hyperlink labels survive an anonymization pass that writes into direct runs only. Runs carrying
+    nothing but field instructions are skipped so field codes stay intact.
+    """
+    try:
+        from docx.oxml.ns import qn
+        from docx.text.run import Run
+    except ImportError:
+        return list(paragraph.runs)
+
+    elements = []
+    for child in paragraph._p:
+        if child.tag == qn("w:r"):
+            elements.append(child)
+        elif child.tag in {qn(name) for name in NESTED_RUN_PARENTS}:
+            elements.extend(descendant for descendant in child.iter(qn("w:r")))
+    writable = []
+    for element in elements:
+        if element.find(qn("w:rPr")) is None and not any(element.find(qn(tag)) is not None for tag in TEXT_CHILD_TAGS):
+            continue
+        if not any(element.find(qn(tag)) is not None for tag in TEXT_CHILD_TAGS):
+            continue
+        writable.append(element)
+    return [Run(element, paragraph) for element in writable]
+
+
+def paragraph_text(paragraph) -> str:
+    return "".join(run.text for run in iter_paragraph_runs(paragraph))
+
+
+def paragraph_has_field(paragraph) -> bool:
+    try:
+        from docx.oxml.ns import qn
+    except ImportError:
+        return False
+    return any(True for _ in paragraph._p.iter(qn("w:fldChar"))) or any(
+        True for _ in paragraph._p.iter(qn("w:instrText"))
+    )
+
+
+def anonymize_docx_paragraph(
+    paragraph,
+    custom_terms: list[tuple[str, str]],
+    field_rules: list[FieldRule],
+    label_contexts: list[str],
+    factory: FakeDataFactory,
+) -> tuple[list[Finding], int]:
+    """Rewrite one paragraph and report how many matches could not be rewritten."""
+
+    text = paragraph_text(paragraph)
+    selected = non_overlapping(docx_paragraph_findings(text, custom_terms, field_rules, label_contexts))
+    if not selected:
+        return [], 0
+    if paragraph_has_field(paragraph):
+        # Field results such as table-of-contents entries are cached in runs that sit next to field
+        # instructions. Collapsing the paragraph into one run would leave the cached original visible,
+        # so rewrite each writable run in place and keep the field structure.
+        for run in iter_paragraph_runs(paragraph):
+            run_text = run.text
+            if not run_text or not docx_paragraph_findings(run_text, custom_terms, field_rules, label_contexts):
+                continue
+            run_new_text, _ = anonymize_docx_paragraph_text(
+                run_text, custom_terms, field_rules, label_contexts, factory
+            )
+            run.text = run_new_text
+        remaining = paragraph_text(paragraph)
+        unresolved = sum(1 for finding in selected if finding.value in remaining)
+        return selected, unresolved
+    new_text, _ = anonymize_docx_paragraph_text(text, custom_terms, field_rules, label_contexts, factory)
+    replace_paragraph_text(paragraph, new_text)
+    return selected, 0
 
 
 def anonymize_docx(
@@ -359,34 +524,69 @@ def anonymize_docx(
     doc = Document(input_path)
     all_findings: list[Finding] = []
     warnings = [
-        "DOCX anonymization covers paragraphs and tables. Review headers, footers, comments, tracked changes, footnotes, and text boxes separately.",
+        "DOCX anonymization covers paragraphs, tables, headers, footers, and core properties. Review comments, tracked changes, footnotes, and text boxes separately.",
         "Paragraphs with matches are rewritten as plain text runs, which may simplify styling inside those paragraphs.",
     ]
 
+    unresolved = 0
+
     for paragraph in doc.paragraphs:
-        new_text, findings = anonymize_text(paragraph.text, custom_terms, field_rules, factory)
-        if findings:
-            replace_paragraph_text(paragraph, new_text)
-            all_findings.extend(findings)
+        findings, missed = anonymize_docx_paragraph(paragraph, custom_terms, field_rules, [], factory)
+        all_findings.extend(findings)
+        unresolved += missed
 
     for table in doc.tables:
         for row in table.rows:
             label_contexts_by_cell = adjacent_field_label_contexts(row, field_rules)
             for cell_index, cell in enumerate(row.cells):
                 for paragraph in cell.paragraphs:
-                    new_text, findings = anonymize_docx_paragraph_text(
-                        paragraph.text,
+                    findings, missed = anonymize_docx_paragraph(
+                        paragraph,
                         custom_terms,
                         field_rules,
                         label_contexts_by_cell.get(cell_index, []),
                         factory,
                     )
-                    if findings:
-                        replace_paragraph_text(paragraph, new_text)
-                        all_findings.extend(findings)
+                    all_findings.extend(findings)
+                    unresolved += missed
+
+    for paragraph in iter_docx_part_paragraphs(doc):
+        findings, missed = anonymize_docx_paragraph(paragraph, custom_terms, field_rules, [], factory)
+        all_findings.extend(findings)
+        unresolved += missed
+
+    if unresolved:
+        warnings.append(
+            f"{unresolved} match(es) live in field or hyperlink runs that split a value across runs; "
+            "they were left in place and verify mode flags them."
+        )
+
+    all_findings.extend(anonymize_docx_metadata(doc, custom_terms, field_rules, factory))
 
     doc.save(output_path)
     return all_findings, warnings
+
+
+def anonymize_docx_metadata(doc, custom_terms, field_rules, factory) -> list[Finding]:
+    findings: list[Finding] = []
+    for attribute in DOCX_METADATA_FIELDS:
+        value = docx_metadata_value(doc, attribute)
+        if not value:
+            continue
+        new_value, attribute_findings = anonymize_text(value, custom_terms, field_rules, factory)
+        if not attribute_findings:
+            continue
+        try:
+            setattr(doc.core_properties, attribute, new_value)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        findings.extend(
+            located_findings(
+                attribute_findings,
+                f"docx property {attribute}",
+            )
+        )
+    return findings
 
 
 def scan_docx(
@@ -401,10 +601,12 @@ def scan_docx(
 
     doc = Document(input_path)
     all_findings: list[Finding] = []
-    warnings = ["DOCX scan covers paragraphs and tables; headers, footers, comments, and text boxes may need manual review."]
+    warnings = [
+        "DOCX scan covers paragraphs, tables, headers, footers, and core properties; comments, text boxes, and tracked changes may need manual review.",
+    ]
 
     for paragraph in doc.paragraphs:
-        all_findings.extend(detect_sensitive_values(paragraph.text, custom_terms, field_rules))
+        all_findings.extend(detect_sensitive_values(paragraph_text(paragraph), custom_terms, field_rules))
 
     for table in doc.tables:
         for row in table.rows:
@@ -413,14 +615,60 @@ def scan_docx(
                 for paragraph in cell.paragraphs:
                     all_findings.extend(
                         docx_paragraph_findings(
-                            paragraph.text,
+                            paragraph_text(paragraph),
                             custom_terms,
                             field_rules,
                             label_contexts_by_cell.get(cell_index, []),
                         )
                     )
 
+    for paragraph in iter_docx_part_paragraphs(doc):
+        all_findings.extend(detect_sensitive_values(paragraph_text(paragraph), custom_terms, field_rules))
+
+    all_findings.extend(docx_metadata_findings(doc, custom_terms, field_rules))
+
     return all_findings, warnings
+
+
+def iter_docx_part_paragraphs(doc):
+    for section in doc.sections:
+        for part_name in DOCX_PART_NAMES:
+            part = getattr(section, part_name, None)
+            if part is None:
+                continue
+            yield from iter_docx_story_paragraphs(part)
+
+
+def iter_docx_story_paragraphs(container):
+    for paragraph in getattr(container, "paragraphs", []):
+        yield paragraph
+    for table in getattr(container, "tables", []):
+        for row in table.rows:
+            for cell in row.cells:
+                yield from cell.paragraphs
+
+
+def docx_metadata_findings(doc, custom_terms, field_rules) -> list[Finding]:
+    findings: list[Finding] = []
+    for attribute in DOCX_METADATA_FIELDS:
+        value = docx_metadata_value(doc, attribute)
+        if not value:
+            continue
+        findings.extend(
+            located_findings(
+                detect_sensitive_values(value, custom_terms, field_rules),
+                f"docx property {attribute}",
+            )
+        )
+    return findings
+
+
+def docx_metadata_value(doc, attribute: str) -> str | None:
+    try:
+        value = getattr(doc.core_properties, attribute, None)
+    except (AttributeError, ValueError):
+        return None
+    return str(value) if value else None
 
 
 def anonymize_docx_paragraph_text(
@@ -474,10 +722,11 @@ def adjacent_field_label_contexts(row, field_rules: list[FieldRule]) -> dict[int
 
 
 def replace_paragraph_text(paragraph, new_text: str) -> None:
-    for run in paragraph.runs:
+    runs = iter_paragraph_runs(paragraph)
+    for run in runs:
         run.text = ""
-    if paragraph.runs:
-        paragraph.runs[0].text = new_text
+    if runs:
+        runs[0].text = new_text
     else:
         paragraph.add_run(new_text)
 
@@ -496,8 +745,8 @@ def anonymize_excel(
     sensitive_unwritable_cells: list[str] = []
     sensitive_unwritable_properties: list[str] = []
     warnings = [
-        "Excel anonymization covers workbook properties, worksheet titles, string cell values, and hyperlink text in worksheets, including hidden sheets.",
-        "Formula expressions and non-string field-rule values are scanned but not anonymized. Review comments, charts, images, shapes, embedded objects, pivot tables, external links, and macros separately.",
+        "Excel anonymization covers workbook properties, worksheet titles, string cell values, hyperlink text, and cell comments (body and author), including hidden sheets.",
+        "Formula expressions and non-string field-rule values are scanned but not anonymized. Review charts, images, shapes, embedded objects, pivot tables, external links, and macros separately.",
     ]
     property_findings, property_unwritable = anonymize_excel_workbook_properties(
         workbook,
@@ -532,7 +781,7 @@ def anonymize_excel(
                 cells_are_labels,
                 next_row,
             )
-            row_is_column_header = bool(header_contexts)
+            row_is_column_header = bool(header_contexts) and not vertical_label_contexts_by_column
             label_contexts_by_column = (
                 {}
                 if row_is_column_header
@@ -581,8 +830,12 @@ def anonymize_excel(
                                 all_findings.extend(findings)
                                 sensitive_unwritable_cells.append(location)
                 all_findings.extend(anonymize_excel_hyperlink(cell, custom_terms, field_rules, factory, location))
-            if header_contexts:
-                vertical_label_contexts_by_column = header_contexts
+                all_findings.extend(anonymize_excel_comment(cell, custom_terms, field_rules, factory, location))
+            if row_is_column_header and header_contexts:
+                vertical_label_contexts_by_column = {
+                    **vertical_label_contexts_by_column,
+                    **header_contexts,
+                }
 
     if formula_cells:
         warnings.append(
@@ -640,8 +893,8 @@ def scan_excel(
     sensitive_unwritable_cells: list[str] = []
     sensitive_unwritable_properties: list[str] = []
     warnings = [
-        "Excel scan covers workbook properties, worksheet titles, string cell values, formula expressions, and hyperlink text in worksheets, including hidden sheets.",
-        "Review non-string cells outside field-rule contexts, comments, charts, images, shapes, embedded objects, pivot tables, external links, and macros separately.",
+        "Excel scan covers workbook properties, worksheet titles, string cell values, formula expressions, hyperlink text, and cell comments (body and author), including hidden sheets.",
+        "Review non-string cells outside field-rule contexts, charts, images, shapes, embedded objects, pivot tables, external links, and macros separately.",
     ]
     property_findings, property_unwritable = scan_excel_workbook_properties(workbook, custom_terms, field_rules)
     all_findings.extend(property_findings)
@@ -672,7 +925,7 @@ def scan_excel(
                 cells_are_labels,
                 next_row,
             )
-            row_is_column_header = bool(header_contexts)
+            row_is_column_header = bool(header_contexts) and not vertical_label_contexts_by_column
             label_contexts_by_column = (
                 {}
                 if row_is_column_header
@@ -729,8 +982,12 @@ def scan_excel(
                         location,
                     )
                 )
-            if header_contexts:
-                vertical_label_contexts_by_column = header_contexts
+                all_findings.extend(scan_excel_comment(cell, custom_terms, field_rules, location))
+            if row_is_column_header and header_contexts:
+                vertical_label_contexts_by_column = {
+                    **vertical_label_contexts_by_column,
+                    **header_contexts,
+                }
 
     if formula_cells:
         warnings.append(
@@ -1193,6 +1450,58 @@ def anonymize_excel_hyperlink(
     return findings
 
 
+def excel_comment_parts(cell) -> list[tuple[str, str]]:
+    """Return (attribute, text) pairs for the comment attached to a cell, if any."""
+
+    comment = getattr(cell, "comment", None)
+    if comment is None:
+        return []
+    return [
+        (attribute, str(value))
+        for attribute, value in (("author", comment.author), ("text", comment.text))
+        if value
+    ]
+
+
+def anonymize_excel_comment(
+    cell,
+    custom_terms: list[tuple[str, str]],
+    field_rules: list[FieldRule],
+    factory: FakeDataFactory,
+    cell_location: str,
+) -> list[Finding]:
+    """Rewrite comment bodies and comment authors, which openpyxl keeps as separate text."""
+
+    comment = getattr(cell, "comment", None)
+    if comment is None:
+        return []
+    findings: list[Finding] = []
+    for attribute, value in excel_comment_parts(cell):
+        new_text, attribute_findings = excel_cell_anonymized_text(value, custom_terms, field_rules, [], factory)
+        if not attribute_findings:
+            continue
+        setattr(comment, attribute, new_text)
+        findings.extend(located_findings(attribute_findings, f"{cell_location} comment {attribute}"))
+    return findings
+
+
+def scan_excel_comment(
+    cell,
+    custom_terms: list[tuple[str, str]],
+    field_rules: list[FieldRule],
+    cell_location: str,
+) -> list[Finding]:
+    findings: list[Finding] = []
+    for attribute, value in excel_comment_parts(cell):
+        findings.extend(
+            located_findings(
+                excel_cell_findings(value, custom_terms, field_rules, []),
+                f"{cell_location} comment {attribute}",
+            )
+        )
+    return findings
+
+
 def scan_excel_hyperlink(
     cell,
     custom_terms: list[tuple[str, str]],
@@ -1232,6 +1541,7 @@ def anonymize_pdf(
     all_findings: list[Finding] = []
     warnings = [
         "PDF anonymization uses redaction annotations and inserts fake text near matched rectangles.",
+        "PDF document metadata is rewritten when it contains detected values.",
         "Review scanned pages, images, annotations, forms, and unusual layouts manually.",
     ]
 
@@ -1257,7 +1567,15 @@ def anonymize_pdf(
                 )
                 continue
             for rect in rects:
-                page.add_redact_annot(rect, text=replacement, fill=(1, 1, 1), text_color=(0, 0, 0))
+                # CJK 替换值必须显式指定中文字体：PyMuPDF 默认 Helvetica 没有中文字形，
+                # 否则替换文本会渲染成 "?"（敏感值仍被删除，但产物不可读、不可检索）。
+                page.add_redact_annot(
+                    rect,
+                    text=replacement,
+                    fill=(1, 1, 1),
+                    text_color=(0, 0, 0),
+                    fontname="china-s",
+                )
                 annotations_added = True
         if missing_redactions:
             raise RuntimeError(
@@ -1266,11 +1584,38 @@ def anonymize_pdf(
         if annotations_added:
             page.apply_redactions()
 
+    all_findings.extend(anonymize_pdf_metadata(doc, custom_terms, field_rules, factory))
+
     doc.save(output_path, garbage=4, deflate=True)
     return all_findings, warnings
 
 
-def plan_outputs(inputs: list[Path], args: argparse.Namespace) -> dict[Path, Path]:
+def anonymize_pdf_metadata(doc, custom_terms, field_rules, factory) -> list[Finding]:
+    findings: list[Finding] = []
+    metadata = dict(doc.metadata or {})
+    updated = False
+    for field in PDF_METADATA_FIELDS:
+        value = metadata.get(field)
+        if not value:
+            continue
+        new_value, field_findings = anonymize_text(str(value), custom_terms, field_rules, factory)
+        if not field_findings:
+            continue
+        metadata[field] = new_value
+        updated = True
+        findings.extend(located_findings(field_findings, f"pdf property {field}"))
+    if updated:
+        doc.set_metadata(metadata)
+    return findings
+
+
+def plan_outputs(
+    inputs: list[Path],
+    args: argparse.Namespace,
+    custom_terms: list[tuple[str, str]] | None = None,
+    field_rules: list[FieldRule] | None = None,
+    factory: FakeDataFactory | None = None,
+) -> dict[Path, Path]:
     if args.mode != "anonymize":
         return {}
 
@@ -1278,30 +1623,50 @@ def plan_outputs(inputs: list[Path], args: argparse.Namespace) -> dict[Path, Pat
     seen: dict[Path, Path] = {}
     roots = input_roots(args.inputs)
     for path in inputs:
-        output_path = output_for(path, args, roots, len(inputs))
+        output_path = output_for(path, args, roots, len(inputs), custom_terms, field_rules, factory)
         validate_output_extension(path, output_path)
         if same_path(path, output_path):
             raise ValueError(f"Refusing to overwrite original file: {safe_report_path(path)}")
         resolved_output = output_path.expanduser().resolve(strict=False)
         if resolved_output in seen:
-            raise ValueError(
-                "Output path collision: "
-                + f"{safe_report_path(seen[resolved_output])} and {safe_report_path(path)} "
-                + f"both map to {safe_report_path(output_path)}"
-            )
+            if not args.anonymize_filenames:
+                raise ValueError(
+                    "Output path collision: "
+                    + f"{safe_report_path(seen[resolved_output])} and {safe_report_path(path)} "
+                    + f"both map to {safe_report_path(output_path)}"
+                )
+            output_path = deduplicated_output(output_path, path)
+            resolved_output = output_path.expanduser().resolve(strict=False)
         seen[resolved_output] = path
         outputs[path] = output_path
     return outputs
 
 
-def output_for(path: Path, args: argparse.Namespace, roots: list[Path], input_count: int) -> Path:
+def deduplicated_output(output_path: Path, input_path: Path) -> Path:
+    digest = hashlib.sha256(str(input_path.expanduser().resolve(strict=False)).encode("utf-8")).hexdigest()[:8]
+    return output_path.with_name(f"{output_path.stem}-{digest}{output_path.suffix}")
+
+
+def output_for(
+    path: Path,
+    args: argparse.Namespace,
+    roots: list[Path],
+    input_count: int,
+    custom_terms: list[tuple[str, str]] | None = None,
+    field_rules: list[FieldRule] | None = None,
+    factory: FakeDataFactory | None = None,
+) -> Path:
     if args.output:
         if input_count > 1:
             raise ValueError("--output can only be used with one input file.")
         return args.output
+    if not args.anonymize_filenames:
+        terms, rules, name_factory = None, None, None
+    else:
+        terms, rules, name_factory = custom_terms, field_rules, factory
     if args.output_dir:
-        return args.output_dir / relative_output_name(path, roots)
-    return path.with_name(anonymized_name(path))
+        return args.output_dir / relative_output_name(path, roots, terms, rules, name_factory)
+    return path.with_name(anonymized_name(path, terms, rules, name_factory))
 
 
 def validate_output_extension(input_path: Path, output_path: Path) -> None:
@@ -1314,19 +1679,33 @@ def validate_output_extension(input_path: Path, output_path: Path) -> None:
         )
 
 
-def anonymized_name(path: Path) -> str:
-    return f"{path.stem}.anonymized{path.suffix}"
+def anonymized_name(
+    path: Path,
+    custom_terms: list[tuple[str, str]] | None = None,
+    field_rules: list[FieldRule] | None = None,
+    factory: FakeDataFactory | None = None,
+) -> str:
+    stem = path.stem
+    if factory is not None:
+        stem, _ = anonymize_text(stem, custom_terms or [], field_rules or [], factory)
+    return f"{stem}.anonymized{path.suffix}"
 
 
-def relative_output_name(path: Path, roots: list[Path]) -> Path:
+def relative_output_name(
+    path: Path,
+    roots: list[Path] | None,
+    custom_terms: list[tuple[str, str]] | None = None,
+    field_rules: list[FieldRule] | None = None,
+    factory: FakeDataFactory | None = None,
+) -> Path:
     resolved_path = path.expanduser().resolve(strict=False)
-    for root in roots:
+    for root in roots or []:
         try:
             relative = resolved_path.relative_to(root)
         except ValueError:
             continue
-        return relative.with_name(anonymized_name(relative))
-    return Path(anonymized_name(path))
+        return relative.with_name(anonymized_name(relative, custom_terms, field_rules, factory))
+    return Path(anonymized_name(path, custom_terms, field_rules, factory))
 
 
 def input_roots(inputs: list[Path]) -> list[Path]:

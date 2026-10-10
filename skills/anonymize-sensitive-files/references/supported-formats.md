@@ -20,13 +20,12 @@ python3 scripts/run_anonymize.py input.docx --report report.json
 
 The runner creates `.venv`, installs `python-docx` from `scripts/requirements.txt`, and runs the lower-level CLI with the virtual environment Python.
 
-The CLI processes paragraphs and table cells. Paragraphs containing findings are rewritten as text runs, so fine-grained styling inside those paragraphs may be simplified.
+The CLI processes body paragraphs, table cells, section headers and footers (including first-page and even-page variants), and core properties (`author`, `last_modified_by`, `title`, `subject`, `comments`, `keywords`, `category`). Author and last-modified-by values are a common leak in legal documents, so they are scanned and rewritten. Paragraphs containing findings are rewritten as text runs, so fine-grained styling inside those paragraphs may be simplified. Runs nested in hyperlinks and content controls are included, because ``paragraph.runs`` alone misses cached table-of-contents text. Paragraphs that contain field instructions are rewritten run by run instead of collapsed, so the cached field result cannot keep the original value next to the replacement and ``w:fldChar`` markers stay intact.
 
 Bundled global field rules are also applied to DOCX tables. If a configured label such as `财务联系人`, `收件人`, or `联行号` appears in one cell, the value in the cell immediately to the right is scanned and anonymized with that rule.
 
 Review or handle separately:
 
-- Headers and footers
 - Footnotes and endnotes
 - Comments
 - Tracked changes
@@ -47,7 +46,7 @@ python3 scripts/run_anonymize.py input.xlsm --mode scan
 
 The runner creates `.venv`, installs `openpyxl` from `scripts/requirements.txt`, and runs the lower-level CLI with the virtual environment Python.
 
-The CLI processes workbook core/custom properties, worksheet titles, string cell values, and hyperlink text/targets in worksheets, including hidden sheets. Workbook structure, styles, merged cells, hidden sheets, and most workbook metadata are preserved by `openpyxl`, but complex workbook features still need manual review after saving. Rich text formatting is preserved for cells that do not require replacement; matched rich text cells may be rewritten as plain strings. `.xlsm` files are opened with VBA preservation enabled, but macro code is not scanned or modified.
+The CLI processes workbook core/custom properties, worksheet titles, string cell values, hyperlink text/targets, and cell comments (both the comment body and the comment author) in worksheets, including hidden sheets. Workbook structure, styles, merged cells, hidden sheets, and most workbook metadata are preserved by `openpyxl`, but complex workbook features still need manual review after saving. Rich text formatting is preserved for cells that do not require replacement; matched rich text cells may be rewritten as plain strings. `.xlsm` files are opened with VBA preservation enabled, but macro code is not scanned or modified.
 
 Bundled global field rules are also applied to adjacent worksheet cells and simple column headers. If a configured label such as `财务联系人`, `收件人`, or `联行号` appears in one cell, the value in the cell immediately to the right is scanned and anonymized with that rule. If a row looks like a header row, such as `A1=姓名`, values below that header are scanned with the same rule.
 
@@ -58,7 +57,7 @@ Numeric, date, and boolean cells are not modified by default to avoid changing c
 Review or handle separately:
 
 - Calculated formula results
-- Comments and threaded comments
+- Threaded comment parts (`xl/threadedComments/*` and `xl/person.xml`), which store authors and replies outside the legacy comment object handled by the CLI
 - Charts, images, shapes, and text boxes
 - Pivot tables and slicers
 - External workbook links and embedded objects
@@ -75,7 +74,7 @@ python3 scripts/run_anonymize.py input.pdf --mode scan
 
 The runner creates `.venv`, installs `pymupdf` from `scripts/requirements.txt`, and runs the lower-level CLI with the virtual environment Python.
 
-The CLI uses PyMuPDF redaction annotations and applies redactions before saving. This removes the matched text rather than drawing a visual cover over it.
+The CLI uses PyMuPDF redaction annotations and applies redactions before saving. This removes the matched text rather than drawing a visual cover over it. PDF document metadata (`title`, `author`, `subject`, `keywords`, `creator`) is scanned and rewritten through `set_metadata`.
 
 If extractable sensitive text is detected but PyMuPDF cannot locate a matching redaction rectangle for it, the CLI fails instead of saving an output that may still contain the original text.
 
@@ -90,7 +89,7 @@ If the scan report says no text layer was found, use OCR before anonymization or
 
 ## Verification
 
-`--mode verify` scans anonymized outputs for residual sensitive values using built-in detectors, bundled field rules, and any supplied custom terms. For Excel, verification includes workbook properties, worksheet titles, string cells, formula expressions, hyperlink text/targets, and non-string field-rule values. Built-in fake values from the CLI's replacement pools are ignored during verification, while values supplied through `--terms` are still reported if they remain. Residual findings make the CLI exit non-zero.
+`--mode verify` scans anonymized outputs for residual sensitive values using built-in detectors, bundled field rules, and any supplied custom terms. For Excel, verification includes workbook properties, worksheet titles, string cells, formula expressions, hyperlink text/targets, cell comments, and non-string field-rule values. Built-in fake values from the CLI's replacement pools are ignored during verification, while values supplied through `--terms` are still reported if they remain. Residual findings make the CLI exit non-zero.
 
 Reports use safe path references instead of raw input, output, or skipped-file paths because file and directory names may themselves contain sensitive values.
 

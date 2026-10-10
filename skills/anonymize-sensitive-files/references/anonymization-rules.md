@@ -5,13 +5,15 @@
 The CLI detects and anonymizes:
 
 - Chinese names when labeled with terms such as `姓名`, `联系人`, `负责人`, `经办人`
-- Chinese mobile phone numbers
+- Chinese mobile phone numbers and landline/fax numbers (`010-65991234`, `021-8888 5678`), reported as category `phone`
 - Email addresses
 - Chinese resident ID numbers with checksum validation
 - Passport-like numbers
 - Bank-card-like numbers with Luhn validation
 - Unified social credit code-like values
-- Address-like Chinese text
+- Chinese addresses that name at least two administrative levels plus a street or house number, for example `上海市浦东新区世纪大道100号`. Single-word matches such as `境外上市`, `资本市场`, or `市场部` are no longer treated as addresses.
+- Litigation case numbers such as `（2020）京0105民初28200号`
+- Administrative document numbers such as `京市监罚字〔2019〕123号`
 - IPv4 addresses, excluding version-like contexts such as `版本 1.2.3.4`
 - URLs and common domains
 - API keys, tokens, secrets, and key-like strings
@@ -35,7 +37,7 @@ Rules support `字段：值` text, DOCX table rows, Excel worksheet rows where t
 
 ## Fake Data Pools
 
-Default fake data is realistic but clearly non-production. Common business categories keep at least 12 candidates each; structured categories such as IDs, cards, IPs, URLs, domains, and secrets keep at least 6 candidates each. The full pools live in `scripts/fake_data.py`.
+Default fake data is realistic but clearly non-production. Business categories (`name`, `org`, `customer`, `project`, `address`, `contract`, `phone`) keep 60-84 candidates each, generated combinatorially at import so a large corpus does not collapse many different real entities onto one fake entity. Structured categories such as IDs, cards, IPs, URLs, domains, and secrets keep at least 6 candidates each. The full pools live in `scripts/fake_data.py`.
 
 - `name`: `张三`, `李四`, `王五`, `赵六`, `孙七`
 - `phone`: `19999999999`, `18888888888`, `16666666666`
@@ -50,8 +52,12 @@ Default fake data is realistic but clearly non-production. Common business categ
 - `ip`: private network examples such as `10.0.0.1`
 - `url` / `domain`: `example.com`, `internal.example.test`
 - `secret`: non-production fake values such as `fake_00000000000000000000000000000000`
+- `case_number`: `（2026）示例0100民初00001号`
+- `doc_number`: `示例监罚字〔2026〕001号`
 
-Within one run, identical originals map to identical fake values.
+Within one run, identical originals map to identical fake values. Across runs the mapping can change because candidates are assigned in order of first appearance, so process a corpus in a single invocation.
+
+A candidate is skipped when it equals or contains any already-known sensitive value (custom terms plus every original replaced so far in the run). If no candidate survives, the CLI emits `示例值-<hash>` instead of reusing a blocked value.
 
 ## Custom Terms File
 
@@ -89,3 +95,16 @@ Default reports do not contain original sensitive values or raw file paths. File
 Use `--seed` only when stable mapping hashes are needed across runs. Choose a high-entropy seed; low-entropy seeds can make phone numbers, IDs, and other enumerable values vulnerable to dictionary checks.
 
 Only use `--export-mapping` with `--mapping` when the user explicitly needs raw original-to-fake mappings. Raw mappings are written to the mapping file only; stdout and JSON reports stay sanitized. Treat mapping outputs as sensitive and store them separately from anonymized deliverables.
+
+## Legal And Securities Field Rules
+
+The bundled rules also cover litigation and IPO-review wording: parties and staff such as `原告`, `被告`,
+`申请人`, `被申请人`, `第三人`, `委托诉讼代理人`, `经办律师`, `审判长`, and `书记员` map to `name`;
+subjects and authorities such as `发行人`, `上市公司`, `拟上市主体`, `被处罚单位`, `处罚机关`, `受理法院`,
+`目标公司`, and `关联方` map to `org`; `项目名称`, `地块`, `宗地`, `楼盘`, and `重组标的` map to `project`;
+`案号` maps to `case_number` and `决定书文号` maps to `doc_number`.
+
+Entity names that regexes cannot discover, such as project codenames, are best handled with a `--terms`
+file. For a corpus without a ready-made list, derive one: scan the corpus once, harvest the values that
+label rules already detect, add shared prefixes and codenames found in file names, then rerun
+anonymization with that terms file.

@@ -92,11 +92,37 @@ BUILTIN_PATTERNS: list[tuple[str, str, re.Pattern[str]]] = [
         "passport",
         re.compile(r"\b[EGPSeps][0-9]{8}\b"),
     ),
+    (
+        "phone",
+        "cn_landline",
+        re.compile(r"(?<!\d)0\d{2,3}[- ]\d{3,4}[- ]?\d{3,4}(?:[- ]\d{1,4})?(?!\d)"),
+    ),
+    (
+        "case_number",
+        "cn_case_number",
+        re.compile(
+            r"[（(]\s*(?:19|20)\d{2}\s*[）)]\s*[\u4e00-\u9fff]{1,8}\d{0,8}[\u4e00-\u9fff]{1,8}\d{1,8}\s*号",
+        ),
+    ),
+    (
+        "doc_number",
+        "cn_doc_number",
+        re.compile(
+            r"[\u4e00-\u9fff]{2,12}字?\s*[〔\[（]\s*(?:19|20)\d{2}\s*[〕\]）]\s*(?:第)?\s*\d{1,6}\s*号",
+        ),
+    ),
 ]
 
 
 NAME_LABEL_PATTERN = re.compile(r"(?P<label>姓名|联系人|客户经理|负责人|经办人)\s*[:：]\s*(?P<name>[\u4e00-\u9fff]{2,4})")
-ADDRESS_PATTERN = re.compile(r"[\u4e00-\u9fff]{2,}(?:省|市|区|县|镇|乡|街道|路|街|号)[\u4e00-\u9fff0-9A-Za-z\-（）()号室单元栋幢弄巷]*")
+ADDRESS_PATTERN = re.compile(
+    r"(?:[\u4e00-\u9fff]{2,8}(?:省|自治区))?"
+    r"[\u4e00-\u9fff]{2,8}市"
+    r"[\u4e00-\u9fff]{1,8}(?:区|县|市|旗)"
+    r"[\u4e00-\u9fff0-9A-Za-z\-（）()]{0,12}"
+    r"(?:大厦|广场|中心|大道|街道|路|街|道|巷|弄|里|村|镇|号|栋|幢|单元|层|室)"
+    r"[\u4e00-\u9fff0-9A-Za-z\-（）()号室单元栋幢弄巷]{0,16}"
+)
 VERSION_CONTEXT_PATTERN = re.compile(r"(?:版本|version|ver\.?|v)\s*$", re.IGNORECASE)
 MARKDOWN_TABLE_HEADER_VALUES = frozenset({"项目", "日期", "签字", "签名", "盖章", "签章"})
 

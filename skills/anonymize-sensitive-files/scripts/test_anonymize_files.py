@@ -1724,5 +1724,319 @@ class AnonymizeFilesTest(unittest.TestCase):
             self.assertNotIn("星云迁移项目", anonymized)
 
 
+    def test_docx_anonymizes_headers_and_core_properties(self):
+        try:
+            from docx import Document
+        except ImportError:
+            self.skipTest("python-docx is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "memo.docx"
+            terms = tmp_path / "terms.txt"
+            doc = Document()
+            doc.core_properties.title = "星河集团档案"
+            doc.sections[0].header.paragraphs[0].text = "星河集团内部资料"
+            doc.add_paragraph("联系人：李雷")
+            doc.save(source)
+            terms.write_text("org:星河集团\n", encoding="utf-8")
+
+            subprocess.run(
+                [sys.executable, str(SCRIPT), str(source), "--terms", str(terms)],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            anonymized_doc = Document(tmp_path / "memo.anonymized.docx")
+            self.assertNotIn("星河集团", anonymized_doc.core_properties.title)
+            self.assertNotIn("星河集团", anonymized_doc.sections[0].header.paragraphs[0].text)
+            self.assertIn("张三", anonymized_doc.paragraphs[0].text)
+
+    def test_pdf_anonymizes_document_metadata(self):
+        try:
+            import fitz
+        except ImportError:
+            self.skipTest("PyMuPDF is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "brief.pdf"
+            terms = tmp_path / "terms.txt"
+            doc = fitz.open()
+            page = doc.new_page()
+            page.insert_text((72, 72), "Quarterly brief")
+            doc.set_metadata({"title": "星河集团并购简报", "author": "星河集团"})
+            doc.save(source)
+            doc.close()
+            terms.write_text("org:星河集团\n", encoding="utf-8")
+
+            subprocess.run(
+                [sys.executable, str(SCRIPT), str(source), "--terms", str(terms)],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            output = fitz.open(tmp_path / "brief.anonymized.pdf")
+            metadata_text = json.dumps(output.metadata, ensure_ascii=False)
+            output.close()
+            self.assertNotIn("星河集团", metadata_text)
+
+    def test_anonymize_filenames_replaces_entities_in_output_file_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "FS-02_启阳项目-社保公积金统计表.md"
+            terms = tmp_path / "terms.txt"
+            source.write_text("项目名称：启阳项目\n", encoding="utf-8")
+            terms.write_text("project:启阳项目\n", encoding="utf-8")
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    str(source),
+                    "--terms",
+                    str(terms),
+                    "--anonymize-filenames",
+                ],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            outputs = sorted(path.name for path in tmp_path.glob("*.anonymized.md"))
+            self.assertEqual(len(outputs), 1)
+            self.assertNotIn("启阳", outputs[0])
+            self.assertTrue(outputs[0].startswith("FS-02_"))
+
+    def test_file_names_are_kept_when_anonymize_filenames_is_not_used(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "FS-02_启阳项目-社保公积金统计表.md"
+            terms = tmp_path / "terms.txt"
+            source.write_text("项目名称：启阳项目\n", encoding="utf-8")
+            terms.write_text("project:启阳项目\n", encoding="utf-8")
+
+            subprocess.run(
+                [sys.executable, str(SCRIPT), str(source), "--terms", str(terms)],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            outputs = sorted(path.name for path in tmp_path.glob("*.anonymized.md"))
+            self.assertEqual(outputs, ["FS-02_启阳项目-社保公积金统计表.anonymized.md"])
+
+
+    def test_replacement_does_not_echo_the_original_brand_through_fake_pools(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "brand.md"
+            terms = tmp_path / "terms.txt"
+            source.write_text("甲方：星河集团\n乙方：星河集团复核\n", encoding="utf-8")
+            terms.write_text("org:星河集团\norg:星河\n", encoding="utf-8")
+
+            subprocess.run(
+                [sys.executable, str(SCRIPT), str(source), "--terms", str(terms)],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            anonymized = (tmp_path / "brand.anonymized.md").read_text(encoding="utf-8")
+            self.assertNotIn("星河", anonymized)
+            self.assertIn("甲方：", anonymized)
+
+
+    def test_xlsx_column_header_context_survives_label_like_data_cells(self):
+        try:
+            from openpyxl import Workbook
+        except ImportError:
+            self.skipTest("openpyxl is not installed")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "ledger.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet["A1"] = "项目名称"
+            sheet["B1"] = "律师事务所"
+            sheet["A2"] = "曲江观邸"
+            sheet["B2"] = "陕西锦路律师事务所"
+            sheet["A3"] = "馨苑"
+            sheet["B3"] = "陕西锦路律师事务所"
+            workbook.save(source)
+            terms = tmp_path / "terms.txt"
+            terms.write_text("org:陕西锦路律师事务所\n", encoding="utf-8")
+
+            subprocess.run(
+                [sys.executable, str(SCRIPT), str(source), "--terms", str(terms)],
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            from openpyxl import load_workbook
+
+            anonymized = load_workbook(tmp_path / "ledger.anonymized.xlsx").active
+            self.assertNotEqual(anonymized["A2"].value, "曲江观邸")
+            self.assertNotEqual(anonymized["A3"].value, "馨苑")
+            self.assertNotIn("锦路", str(anonymized["B2"].value) + str(anonymized["B3"].value))
+
+
+    def test_verify_treats_fake_value_plus_non_sensitive_suffix_as_clean(self):
+        finding = anonymize_files.Finding("name", "张敏（男性）", 0, 6, "field_rules", "联系人")
+        self.assertEqual(anonymize_files.verify_findings([finding], [], []), [])
+
+        leftover = anonymize_files.Finding("name", "某某某公司", 0, 5, "field_rules", "联系人")
+        self.assertEqual(len(anonymize_files.verify_findings([leftover], [], [])), 1)
+
+    def test_traversal_order_does_not_change_fake_value_assignment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source_dir = tmp_path / "corpus"
+            source_dir.mkdir()
+            (source_dir / "a.md").write_text("项目名称：启阳项目\n承租人：融辉集团\n", encoding="utf-8")
+            (source_dir / "b.md").write_text("法定代表人：张三\n", encoding="utf-8")
+            (source_dir / "c.md").write_text("启阳项目与融辉集团的补充协议\n", encoding="utf-8")
+            terms = tmp_path / "terms.txt"
+            terms.write_text("project:启阳项目\norg:融辉集团\nname:张三\n", encoding="utf-8")
+            recursive_map = tmp_path / "map-recursive.json"
+            explicit_map = tmp_path / "map-explicit.json"
+
+            subprocess.run(
+                [
+                    sys.executable, str(SCRIPT), str(source_dir), "--recursive",
+                    "--terms", str(terms),
+                    "--output-dir", str(tmp_path / "out-recursive"),
+                    "--mapping", str(recursive_map), "--export-mapping",
+                ],
+                text=True, capture_output=True, check=True,
+            )
+            subprocess.run(
+                [
+                    sys.executable, str(SCRIPT),
+                    str(source_dir / "c.md"), str(source_dir / "b.md"), str(source_dir / "a.md"),
+                    "--terms", str(terms),
+                    "--output-dir", str(tmp_path / "out-explicit"),
+                    "--mapping", str(explicit_map), "--export-mapping",
+                ],
+                text=True, capture_output=True, check=True,
+            )
+
+            self.assertEqual(
+                json.loads(recursive_map.read_text(encoding="utf-8")),
+                json.loads(explicit_map.read_text(encoding="utf-8")),
+            )
+            for name in ("a.md", "b.md", "c.md"):
+                first = (tmp_path / "out-recursive" / f"{Path(name).stem}.anonymized.md").read_text(encoding="utf-8")
+                second = (tmp_path / "out-explicit" / f"{Path(name).stem}.anonymized.md").read_text(encoding="utf-8")
+                self.assertEqual(first, second, name)
+
+    def test_explicit_duplicate_input_paths_are_processed_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "note.md"
+            source.write_text("联系人：张三\n", encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable, str(SCRIPT), str(source), str(source),
+                    "--output-dir", str(tmp_path / "out"), "--report", str(tmp_path / "report.json"),
+                ],
+                text=True, capture_output=True, check=True,
+            )
+
+            report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["summary"]["files_processed"], 1)
+            self.assertEqual(len(list((tmp_path / "out").iterdir())), 1)
+
+    def test_xlsx_anonymizes_cell_comment_body_and_author(self):
+        from openpyxl import Workbook, load_workbook
+        from openpyxl.comments import Comment
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "ledger.xlsx"
+            terms = tmp_path / "terms.txt"
+            book = Workbook()
+            sheet = book.active
+            sheet["A1"] = "项目名称"
+            sheet["B1"] = "启阳项目"
+            sheet["B1"].comment = Comment("启阳项目由刘秀军负责", "刘秀军")
+            book.save(source)
+            terms.write_text("project:启阳项目\nname:刘秀军\n", encoding="utf-8")
+
+            subprocess.run(
+                [
+                    sys.executable, str(SCRIPT), str(source),
+                    "--terms", str(terms), "--output-dir", str(tmp_path / "out"),
+                    "--report", str(tmp_path / "report.json"),
+                ],
+                text=True, capture_output=True, check=True,
+            )
+
+            output = next((tmp_path / "out").glob("*.anonymized.xlsx"))
+            comment = load_workbook(output).active["B1"].comment
+            rendered = f"{comment.author} {comment.text}"
+            self.assertNotIn("启阳项目", rendered)
+            self.assertNotIn("刘秀军", rendered)
+            self.assertNotIn("启阳项目", str(load_workbook(output).active["B1"].value))
+            locations = [
+                finding["location"]
+                for finding in json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))["outputs"][0]["findings"]
+            ]
+            self.assertTrue(any(item.endswith("comment author") for item in locations), locations)
+            self.assertTrue(any(item.endswith("comment text") for item in locations), locations)
+
+    def test_docx_field_cached_hyperlink_text_is_anonymized_without_breaking_the_field(self):
+        from docx import Document
+        from docx.oxml import parse_xml
+        from docx.oxml.ns import nsdecls
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = tmp_path / "opinion.docx"
+            terms = tmp_path / "terms.txt"
+
+            document = Document()
+            document.add_paragraph("正文：法定代表人张三。")
+            paragraph = document.add_paragraph()
+            for chunk in (
+                f'<w:r {nsdecls("w")}><w:fldChar w:fldCharType="begin"/></w:r>',
+                f'<w:r {nsdecls("w")}><w:instrText xml:space="preserve"> TOC \\o "1-3" </w:instrText></w:r>',
+                f'<w:r {nsdecls("w")}><w:fldChar w:fldCharType="separate"/></w:r>',
+                f'<w:hyperlink {nsdecls("w")}>'
+                "<w:r><w:t>关于</w:t></w:r>"
+                "<w:r><w:t>金辉控股</w:t></w:r>"
+                "<w:r><w:t>的说明</w:t></w:r>"
+                "</w:hyperlink>",
+                f'<w:r {nsdecls("w")}><w:fldChar w:fldCharType="end"/></w:r>',
+            ):
+                paragraph._p.append(parse_xml(chunk))
+            document.save(source)
+            terms.write_text("org:金辉控股\nname:张三\n", encoding="utf-8")
+
+            subprocess.run(
+                [
+                    sys.executable, str(SCRIPT), str(source),
+                    "--terms", str(terms), "--output-dir", str(tmp_path / "out"),
+                ],
+                text=True, capture_output=True, check=True,
+            )
+
+            output = next((tmp_path / "out").glob("*.anonymized.docx"))
+            with zipfile.ZipFile(output) as archive:
+                xml = archive.read("word/document.xml").decode("utf-8")
+            self.assertNotIn("金辉控股", xml)
+            self.assertNotIn("张三", xml)
+            self.assertIn('w:instrText', xml)
+            self.assertIn("TOC", xml)
+            self.assertIn("关于", xml)
+            self.assertIn("的说明", xml)
+
+
+
 if __name__ == "__main__":
     unittest.main()

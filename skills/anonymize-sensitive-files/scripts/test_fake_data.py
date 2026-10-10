@@ -35,5 +35,20 @@ class FakeDataPoolsTest(unittest.TestCase):
         self.assertNotEqual(first_hash, second_hash)
 
 
+    def test_business_pools_stay_unique_across_many_originals(self):
+        factory = FakeDataFactory()
+        for category in ["name", "org", "address", "project", "customer"]:
+            replacements = [factory.replacement_for(category, f"真实{category}{index}") for index in range(60)]
+            self.assertEqual(len(set(replacements)), 60, category)
+
+
+    def test_reserved_terms_are_never_embedded_in_replacements(self):
+        factory = FakeDataFactory()
+        factory.reserve(["金辉"])
+        for index in range(24):
+            replacement = factory.replacement_for("org", f"金辉房地产{index}有限公司")
+            self.assertNotIn("金辉", replacement)
+
+
 if __name__ == "__main__":
     unittest.main()
