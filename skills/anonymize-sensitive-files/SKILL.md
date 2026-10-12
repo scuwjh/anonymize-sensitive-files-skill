@@ -148,7 +148,8 @@ export ANONYMIZE_LLM_API_KEY="sk-..."
 ```
 
 - Required: `ANONYMIZE_LLM_ENDPOINT`, `ANONYMIZE_LLM_MODEL`, `ANONYMIZE_LLM_API_KEY` (falls back to `DEEPSEEK_API_KEY`).
-- Optional: `ANONYMIZE_LLM_TIMEOUT`, `ANONYMIZE_LLM_MAX_RETRIES`, `ANONYMIZE_LLM_MAX_TOKENS`, `ANONYMIZE_LLM_TEMPERATURE`, `ANONYMIZE_LLM_CACHE_DIR`.
+- Optional: `ANONYMIZE_LLM_TIMEOUT`, `ANONYMIZE_LLM_MAX_RETRIES`, `ANONYMIZE_LLM_MAX_TOKENS`, `ANONYMIZE_LLM_TEMPERATURE`, `ANONYMIZE_LLM_CACHE_DIR`, and `ANONYMIZE_LLM_EXTRA_BODY` (a JSON object merged into the request body).
+- Reasoning models spend their `max_tokens` budget on hidden thinking first, so a large batch can return an empty `content` (the CLI reports `reasoning_tokens` and suggests a fix). For such models set `ANONYMIZE_LLM_EXTRA_BODY='{"enable_thinking": false}'`; measured on `deepseek-v4-flash-0731`, that cut a 3-candidate batch from 19.8s/1706 tokens to 3.0s/141 tokens with identical verdicts.
 - Precedence: CLI flags (`--llm-endpoint`, `--llm-model`, `--cache-dir`) > environment > defaults.
 - If a required variable is missing the tool lists exactly which ones and exits; `--dry-run` needs no variables at all. The startup line prints a config summary with the key masked as `sk-***`.
 

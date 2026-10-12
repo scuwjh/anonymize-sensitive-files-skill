@@ -403,5 +403,79 @@ class ConfigFromEnvTest(unittest.TestCase):
         self.assertNotIn("secretvalue", summary)
 
 
+class ExtraBodyAndTransportTest(unittest.TestCase):
+    """请求体透传与空正文（推理模型耗尽 max_tokens）的可操作报错。"""
+
+    @staticmethod
+    def _response(payload):
+        class _Resp:
+            def __init__(self, blob):
+                self._blob = blob
+
+            def read(self):
+                return self._blob
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Resp(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+    def test_extra_body_is_merged_into_request_body(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            return self._response({"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]})
+
+        config = LLMConfig(endpoint="http://x/v1/chat/completions", model="m", api_key="k",
+                           extra_body={"enable_thinking": False})
+        with patch("urllib.request.urlopen", fake_urlopen):
+            from llm_client import default_transport
+
+            default_transport(config, "s", "u")
+        self.assertIs(captured["body"]["enable_thinking"], False)
+        self.assertEqual(captured["body"]["model"], "m")
+
+    def test_empty_content_error_names_the_reason_and_fix(self):
+        def fake_urlopen(req, timeout=None):
+            return self._response({
+                "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+                "usage": {"completion_tokens": 4096,
+                          "completion_tokens_details": {"reasoning_tokens": 4096}},
+            })
+
+        config = LLMConfig(endpoint="http://x/v1/chat/completions", model="m", api_key="k")
+        with patch("urllib.request.urlopen", fake_urlopen):
+            from llm_client import default_transport
+
+            with self.assertRaises(LLMError) as ctx:
+                default_transport(config, "s", "u")
+        message = str(ctx.exception)
+        self.assertIn("空 content", message)
+        self.assertIn("reasoning_tokens=4096", message)
+        self.assertIn("enable_thinking", message)
+
+    def test_extra_body_parsed_from_env(self):
+        with patch.dict(os.environ, {ENV_PREFIX + "EXTRA_BODY": '{"enable_thinking": false}'}, clear=True):
+            cfg = LLMConfig.from_env()
+        self.assertEqual(cfg.extra_body, {"enable_thinking": False})
+
+    def test_invalid_extra_body_from_env_is_rejected(self):
+        with patch.dict(os.environ, {ENV_PREFIX + "EXTRA_BODY": "not-json"}, clear=True):
+            with self.assertRaises(LLMError):
+                LLMConfig.from_env()
+        with patch.dict(os.environ, {ENV_PREFIX + "EXTRA_BODY": "[1, 2]"}, clear=True):
+            with self.assertRaises(LLMError):
+                LLMConfig.from_env()
+
+    def test_summary_shows_extra_body(self):
+        cfg = LLMConfig(endpoint="http://x/v1/chat/completions", model="m",
+                        api_key="sk-abcdef123", extra_body={"enable_thinking": False})
+        self.assertIn("enable_thinking", cfg.summary())
+
+
 if __name__ == "__main__":
     unittest.main()

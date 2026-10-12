@@ -28,7 +28,7 @@ import os
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit
@@ -79,18 +79,30 @@ class LLMConfig:
     endpoint: str = ""
     model: str = ""
     api_key: str = ""
-    timeout_seconds: float = 60.0
+    timeout_seconds: float = 120.0
     max_retries: int = 2
     retry_backoff_seconds: float = 2.0
     max_tokens: int = 4096
     temperature: float = 0.0
     cache_dir: str = ".llm-cache"
     use_json_response_format: bool = False
+    # 透传到请求体的额外参数；推理模型建议 {"enable_thinking": false}
+    extra_body: dict = field(default_factory=dict)
 
     @classmethod
     def from_env(cls, overrides: dict[str, Any] | None = None) -> "LLMConfig":
         """从环境变量构造配置；overrides 中非 None 的项覆盖环境变量。"""
         env = os.environ
+        raw_extra = env.get(ENV_PREFIX + "EXTRA_BODY", "").strip()
+        extra: dict = {}
+        if raw_extra:
+            try:
+                parsed = json.loads(raw_extra)
+            except json.JSONDecodeError as exc:
+                raise LLMError(f"环境变量 {ENV_PREFIX}EXTRA_BODY 不是合法 JSON: {exc}") from exc
+            if not isinstance(parsed, dict):
+                raise LLMError(f"环境变量 {ENV_PREFIX}EXTRA_BODY 必须是 JSON 对象")
+            extra = parsed
         cfg = cls(
             endpoint=env.get(ENV_PREFIX + "ENDPOINT", "").strip(),
             model=env.get(ENV_PREFIX + "MODEL", "").strip(),
@@ -98,11 +110,12 @@ class LLMConfig:
                 env.get(ENV_PREFIX + "API_KEY", "").strip()
                 or env.get(FALLBACK_API_KEY_ENV, "").strip()
             ),
-            timeout_seconds=_env_float("TIMEOUT", 60.0),
+            timeout_seconds=_env_float("TIMEOUT", 120.0),
             max_retries=_env_int("MAX_RETRIES", 2),
             max_tokens=_env_int("MAX_TOKENS", 4096),
             temperature=_env_float("TEMPERATURE", 0.0),
             cache_dir=env.get(ENV_PREFIX + "CACHE_DIR", ".llm-cache").strip() or ".llm-cache",
+            extra_body=extra,
         )
         for key, value in (overrides or {}).items():
             if value is not None:
@@ -130,10 +143,11 @@ class LLMConfig:
     def summary(self) -> str:
         """配置摘要（含遮蔽后的密钥），可安全打印。"""
         host = urlsplit(self.endpoint).netloc or self.endpoint
+        extra = f" extra_body={json.dumps(self.extra_body, ensure_ascii=False)}" if self.extra_body else ""
         return (
             f"endpoint={host} model={self.model} api_key={mask_key(self.api_key)} "
             f"cache_dir={self.cache_dir} timeout={self.timeout_seconds}s "
-            f"max_retries={self.max_retries}"
+            f"max_retries={self.max_retries} max_tokens={self.max_tokens}{extra}"
         )
 
 
@@ -206,6 +220,8 @@ def default_transport(config: LLMConfig, system: str, user: str) -> str:
     }
     if config.use_json_response_format:
         body["response_format"] = {"type": "json_object"}
+    if config.extra_body:
+        body.update(config.extra_body)
     req = urllib.request.Request(
         config.endpoint,
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -228,9 +244,29 @@ def default_transport(config: LLMConfig, system: str, user: str) -> str:
         raise LLMError(f"网络错误: {exc.reason}") from exc
     payload = json.loads(raw)
     try:
-        return payload["choices"][0]["message"]["content"]
+        choice = payload["choices"][0]
+        content = choice["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         raise LLMError(f"响应结构不符合 OpenAI 兼容格式: {raw[:300]}") from exc
+    if not (content or "").strip():
+        # 典型原因：推理模型把 max_tokens 全用在思考上，导致没有正文输出
+        usage = payload.get("usage", {}) or {}
+        reasoning = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+        finish = choice.get("finish_reason")
+        detail = f"finish_reason={finish}"
+        if usage.get("completion_tokens") is not None:
+            detail += f", completion_tokens={usage.get('completion_tokens')}"
+        if reasoning is not None:
+            detail += f", reasoning_tokens={reasoning}"
+        hint = ""
+        if finish == "length" or (reasoning and usage.get("completion_tokens") == reasoning):
+            hint = (
+                "；输出被推理内容占满。若是推理模型，可设置 "
+                "ANONYMIZE_LLM_EXTRA_BODY='{\"enable_thinking\": false}' 关闭思考，"
+                "或调大 ANONYMIZE_LLM_MAX_TOKENS、调小批大小"
+            )
+        raise LLMError(f"模型返回空 content（{detail}）{hint}")
+    return content
 
 
 class LLMClient:

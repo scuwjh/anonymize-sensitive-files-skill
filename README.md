@@ -281,8 +281,17 @@ ANONYMIZE_LLM_API_KEY="sk-..." ANONYMIZE_LLM_ENDPOINT="https://…" ANONYMIZE_LL
 | `ANONYMIZE_LLM_MAX_TOKENS` | | `4096` | 单次响应上限 |
 | `ANONYMIZE_LLM_TEMPERATURE` | | `0` | 采样温度 |
 | `ANONYMIZE_LLM_CACHE_DIR` | | `.llm-cache` | 请求缓存目录 |
+| `ANONYMIZE_LLM_EXTRA_BODY` | | — | 透传到请求体的额外 JSON；推理模型建议 `{"enable_thinking": false}` |
 
 临时切换端点或模型可用 `--llm-endpoint` / `--llm-model` / `--cache-dir` 覆盖。启动时会打印一行配置摘要（端点主机、模型、缓存目录），密钥一律显示为 `sk-***`；密钥不会出现在报告、日志或缓存里。
+
+**推理模型的坑（务必先读）**：部分模型（实测 `deepseek-v4-flash-0731`）会先输出大段思考，且思考 token **计入 `max_tokens` 上限**。批量送审时思考可能吃光全部额度，返回的正文为空——表现为请求很慢/超时，重试后整批降级为待人工。解决方式是透传关闭思考的参数：
+
+```bash
+export ANONYMIZE_LLM_EXTRA_BODY='{"enable_thinking": false}'
+```
+
+实测同一批 3 条候选：默认参数 19.8 秒 / 输出 1706 token（其中思考 1581），关闭思考后 **3.0 秒 / 141 token**，判定质量不变；30 条候选从「跑不完」变成 17 秒完成。若你的模型不认这个参数，网关通常只是忽略它；若报错则去掉该变量即可。
 
 **四道闸门**（每条模型判定都要过，不过即丢弃并计数）：
 
