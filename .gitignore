@@ -16,3 +16,8 @@ exams/
 mapping.json
 *.mapping.json
 
+# LLM 配置与请求缓存：前者含密钥、后者含送审原文片段，均不入库。
+llm-config.json
+.llm-cache/
+.llm-cache-dryrun/
+

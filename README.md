@@ -16,6 +16,7 @@
 - [目录批处理](#目录批处理)
 - [自定义敏感词](#自定义敏感词)
 - [词表生成](#词表生成)
+- [LLM 辅助审核](#llm-辅助审核)
 - [报告与映射](#报告与映射)
 - [安全策略](#安全策略)
 - [人工审核](#人工审核)
@@ -155,6 +156,7 @@ python3 scripts/run_anonymize.py path/to/input.anonymized.md \
 - 业务类假值池按下拉生成扩容到 60-84 个候选，避免上百个真实实体挤进 12 个假名。
 - PDF 脱敏的替换文字使用内置中文字体（`china-s`）写入，保证简体、繁体和全角标点正确渲染；替换文字过长时会自动缩小字号以适应原占位框。
 - 提供词表生成器 `scripts/build_terms.py`：从语料自动挖掘公司、项目、机构、人员等候选实体，做类别判定与文件级覆盖校验，输出可直接使用的候选词表和人工审计表。
+- 可选接入大模型做候选语义审核（`scripts/review_terms_llm.py`）：只做判定、不生成内容、不写文件，所有判定须过四道闸门（结构校验 / 原文锚定 / 交叉校验 / 非对称权限），并带请求级缓存。
 - 提供审核标记工具 `scripts/mark_review.py`：在脱敏产物上标出每一处替换（假值对应哪个原值），并生成 diff 清单，便于逐条人工复核。
 - 支持 Markdown 表格、DOCX 表格和 Excel 工作表里的相邻字段，例如 `A1=法定代表人`, `B1=某姓名`；Excel 也支持列头在上、值在下的字段规则，例如 `A1=姓名`, `A2=某姓名`。
 - Excel 处理覆盖工作簿属性、工作表名、字符串单元格和 hyperlink 文本/目标，并会尽量保留工作簿、样式、隐藏表和宏；批注、图片、图表、文本框、透视表、嵌入对象和宏代码需要额外复核。
@@ -240,6 +242,57 @@ customer:示例客户
 
 词表是脱敏效果的上限：正则和字段规则只能发现「有固定形态」的敏感值，公司名、项目代号这类开放集合实体若不在词表里就不会被替换，`verify` 也不会报错。因此建议先跑一次词表生成，人工确认低置信分桶后，再带 `--terms` 执行正式脱敏。
 
+## LLM 辅助审核
+
+`scripts/build_terms.py` 的候选里，类别判定和「是不是敏感实体」本质是语义问题，纯规则会有天花板（人名边界、宽泛项目名、未定义简称等）。可选接入大模型对候选做语义审核：
+
+```bash
+# 1. 复制配置样例，填入你的 endpoint / model / api_key
+cp skills/anonymize-sensitive-files/scripts/llm-config.example.json \
+   skills/anonymize-sensitive-files/scripts/llm-config.json
+
+# 2. 先用演练模式验证流程（不联网，用本地桩）
+.venv/bin/python scripts/review_terms_llm.py \
+  --audit ./terms-build/terms-audit.json \
+  --out-dir ./terms-build \
+  --dry-run
+
+# 3. 正式审核
+.venv/bin/python scripts/review_terms_llm.py \
+  --audit ./terms-build/terms-audit.json \
+  --out-dir ./terms-build \
+  --llm-config scripts/llm-config.json \
+  --batch-size 15 --min-confidence 0.6
+```
+
+配置项（`llm-config.json`，该文件已在 `.gitignore` 中，不会入库）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `endpoint` | OpenAI 兼容的 `/chat/completions` 地址 |
+| `model` | 模型名 |
+| `api_key` | 密钥；留空则读 `api_key_env` 指定的环境变量 |
+| `api_key_env` | 环境变量名，默认 `DEEPSEEK_API_KEY` |
+| `timeout_seconds` / `max_retries` / `temperature` | 超时、重试次数、采样温度（默认 0） |
+| `cache_dir` | 请求级缓存目录，默认 `.llm-cache` |
+
+**四道闸门**（每条模型判定都要过，不过即丢弃并计数）：
+
+1. **结构闸门** —— `term` 必须逐字等于本批输入中的候选（改写、缩写或编造一律丢弃）、`action`/`category` 必须在枚举内、`confidence` 必须在 `[0,1]`；
+2. **原文锚定闸门** —— 判 `keep` 时必须给出原文引文 `quote`，且该引文去掉空白后必须是输入证据的子串，否则视为幻觉丢弃；
+3. **交叉闸门** —— 与代码层建议类别冲突的判定降级为待人工；
+4. **非对称权限** —— 模型的 `veto` 只产出「建议否决」清单交由人工确认，**不自动剔除候选**；否决含公司/机构后缀的候选会被改判为待人工。因为漏脱敏远比误脱敏严重，模型在「删除」方向上的权限被收紧。
+
+产出：
+
+| 文件 | 内容 |
+| --- | --- |
+| `llm-review.json` | 全部判定与分桶（含被闸门丢弃的明细，用于观察模型幻觉率） |
+| `llm-review.md` | 人读版：自动采纳 / 建议否决 / 待人工 / 丢弃统计 |
+| `terms-llm-accepted.txt` | 经模型确认的候选词表，供与人工裁决结果合并 |
+
+稳定性和可复现性：审核是**构建期的离线一次性环节**，正式脱敏运行不调用任何模型；审核结果按 `(model, prompt 版本, 输入)` 落盘缓存，重跑命中缓存不重复请求（实测第二遍 0 次网络调用）；词表经人工确认后冻结，同一批次重跑结果一致。
+
 ## 报告与映射
 
 默认报告不会输出原始敏感值或原始文件路径，只包含安全路径引用、扩展名、类别、脱敏位置、长度、统计信息和警告。`verify` 会忽略假值本身，也会忽略“假值 + 无敏感信息的括号日期尾巴”这类组合串，但对仍包含词表词或正则可检值的单元格一律报残留。Excel 报告位置使用 `sheet 1!A1`、`workbook property title` 这类不含原始工作表名或属性值的坐标。
@@ -269,6 +322,7 @@ python3 scripts/run_anonymize.py input.md \
 - Excel 公式中如检出敏感值，脱敏模式会失败而不是保存残留敏感值的工作簿。
 - Excel 相邻字段右侧的数字、日期、布尔值等非字符串单元格如检出敏感值，脱敏模式会失败而不是静默保留。
 - 扫描件、图片中的文字、PDF 注释、DOCX 页眉页脚、文本框、批注和修订痕迹需要额外人工复核。
+- 使用 LLM 辅助审核时，送审内容与请求缓存都包含原文片段，属于敏感产物：只应发往你信任的端点，缓存目录按敏感数据处理，不要入库或对外分发。模型输出永远不直接写入文件——替换只由本地代码依据冻结词表执行。
 
 本工具不能替代最终人工审核。高风险文件建议按 `scan` -> `anonymize` -> `verify` 的顺序处理，并根据报告中的 warning 复核不受自动处理覆盖的内容。
 
@@ -330,7 +384,10 @@ skills/anonymize-sensitive-files/
     ├── detectors.py          # 内置正则与字段规则检测
     ├── fake_data.py          # 假值池与映射（假值一致性、防品牌残留）
     ├── build_terms.py        # 实体词表生成器（候选发现 → 聚类 → 覆盖校验）
+    ├── llm_client.py         # OpenAI 兼容调用与请求级缓存（标准库实现，无第三方依赖）
+    ├── review_terms_llm.py   # 可选：LLM 候选审核（四道闸门 + 三桶分流）
     ├── mark_review.py        # 脱敏产物审核标记（批注 / 高亮 / diff 清单）
+    ├── llm-config.example.json  # LLM 配置样例（真实 llm-config.json 与缓存不入库）
     ├── requirements.txt
     └── test_*.py             # unittest 回归测试
 ```

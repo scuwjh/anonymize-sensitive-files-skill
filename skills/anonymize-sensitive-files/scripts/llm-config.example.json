@@ -1,0 +1,13 @@
+{
+  "endpoint": "https://your-endpoint.example.com/v1/chat/completions",
+  "model": "deepseek-v41-flash",
+  "api_key": "",
+  "api_key_env": "DEEPSEEK_API_KEY",
+  "timeout_seconds": 60,
+  "max_retries": 2,
+  "retry_backoff_seconds": 2,
+  "max_tokens": 4096,
+  "temperature": 0,
+  "cache_dir": ".llm-cache",
+  "use_json_response_format": false
+}

@@ -14,7 +14,7 @@ Use this skill to replace sensitive document data with realistic fake values whi
 1. Identify the input files and file types.
 2. Use the CLI's bundled global field rules for every supported document type; they are loaded by default from `references/sensitive-field-rules.yaml`.
 3. Run `scan` first for unfamiliar or high-risk files.
-4. If the corpus has no terms file yet, run `scripts/build_terms.py` to mine candidate entities from the corpus, then confirm the low-confidence buckets in its audit output before using the draft as `--terms`. Regexes and field rules only catch fixed shapes, so open-set entities such as company names, project codenames, and person names are replaced only if they are in the terms file; this step sets the ceiling of what gets replaced.
+4. If the corpus has no terms file yet, run `scripts/build_terms.py` to mine candidate entities from the corpus, then confirm the low-confidence buckets in its audit output before using the draft as `--terms`. Regexes and field rules only catch fixed shapes, so open-set entities such as company names, project codenames, and person names are replaced only if they are in the terms file; this step sets the ceiling of what gets replaced. When an OpenAI-compatible endpoint is configured, `scripts/review_terms_llm.py` can pre-judge the candidates, but every verdict must pass the four gates below and never writes files itself.
 5. Process the whole batch in ONE invocation (`--recursive` or all paths at once). Fake values are assigned in order of first appearance, so splitting a batch across separate runs maps the same original value to different fake values in different batches. `--seed` only stabilizes report hashes; it does not keep fake values consistent across runs.
 6. Run `anonymize` to create new output files; the CLI refuses outputs that overwrite originals. Add `--anonymize-filenames` when file names contain entity names, project codenames, or person names, because default output names reuse the original stem.
 7. Run `verify` on anonymized outputs with the same `--terms` file. Verification ignores findings that are built-in fake values, and ignores label-context values that are only fake value plus non-sensitive scaffolding (for example `北京星河科技有限公司（2019/6/15）`); any value that still contains a term or a detected pattern after removing fake values is reported. Residual findings make the CLI exit non-zero.
@@ -38,10 +38,11 @@ python3 scripts/run_anonymize.py input.docx --field-rules custom_field_rules.yam
 python3 scripts/run_anonymize.py input.docx --no-field-rules
 python3 scripts/run_anonymize.py output.anonymized.md --mode verify --terms sensitive_terms.txt
 .venv/bin/python scripts/build_terms.py ./docs --out-dir ./terms-build
+.venv/bin/python scripts/review_terms_llm.py --audit ./terms-build/terms-audit.json --out-dir ./terms-build --dry-run
 .venv/bin/python scripts/mark_review.py --input-dir ./anonymized --mapping raw-mapping.json --out-dir ./review
 ```
 
-`run_anonymize.py` only wraps the scan/anonymize/verify CLI. `build_terms.py` and `mark_review.py` reuse the same virtual environment, so run `run_anonymize.py --help` once (which prepares `.venv`) before using them.
+`run_anonymize.py` only wraps the scan/anonymize/verify CLI. `build_terms.py`, `review_terms_llm.py`, and `mark_review.py` reuse the same virtual environment, so run `run_anonymize.py --help` once (which prepares `.venv`) before using them.
 
 `scripts/run_anonymize.py` automatically creates `.venv`, installs `scripts/requirements.txt`, and runs the real CLI through the virtual environment Python. This avoids polluting global Python installs and works even when the caller cannot activate a shell environment.
 
@@ -129,6 +130,26 @@ Outputs:
 
 Review the low-confidence buckets and merge in any terms only a human can confirm before relying on the draft. Treat low coverage on a parsable file as a signal of missed entities, and low coverage on a scanned PDF as confirmation that it has no text layer.
 
+## LLM-Assisted Review (optional)
+
+When an OpenAI-compatible endpoint is available, `scripts/review_terms_llm.py` reviews mined candidates semantically (category, keep/veto). It is a build-time offline step: the anonymize run itself never calls a model, and the model never generates terms, fake values, or file content.
+
+```bash
+.venv/bin/python scripts/review_terms_llm.py \
+  --audit ./terms-build/terms-audit.json --out-dir ./terms-build --dry-run
+```
+
+Copy `scripts/llm-config.example.json` to `scripts/llm-config.json` and fill `endpoint`, `model`, and `api_key` (or leave `api_key` empty and set the environment variable named by `api_key_env`). The real config file and the request cache are gitignored.
+
+Every verdict must pass four gates; a failing verdict is dropped and counted, never silently accepted:
+
+1. **Structure** — `term` must be byte-identical to a candidate in the batch (rewrites, abbreviations, and invented terms are dropped); `action` and `category` must be inside the allowed sets; `confidence` must be within `[0, 1]`.
+2. **Grounding** — a `keep` verdict must carry a `quote` that occurs verbatim in the supplied evidence (whitespace-insensitive); otherwise it is treated as a hallucination and dropped.
+3. **Cross-check** — a category that disagrees with the code-layer suggestion is downgraded to manual review.
+4. **Asymmetric authority** — a model `veto` only produces a "suggested veto" list for humans; candidates are never removed automatically, and vetoes of entity-looking names are escalated to manual review. Missing an entity is worse than over-redacting, so the model's authority to delete is restricted.
+
+`--dry-run` exercises the whole pipeline with a local stub and no network. Verdicts are cached per `(model, prompt version, input)`, so a rerun does not call the API again. Use `--dry-run` to confirm plumbing, then run for real and merge `terms-llm-accepted.txt` with the human-confirmed buckets.
+
 ## Global Field Rules
 
 The bundled rules in `references/sensitive-field-rules.yaml` apply to all supported file types, not only contracts. They cover common label/value fields such as emergency contacts, finance contacts, recipients, phone/email fields, addresses, bank accounts, bank routing codes, organizations, and common identifiers.
@@ -159,6 +180,7 @@ It also writes `review-diff.txt` for reading and `review-diff.json` for filterin
 - Do not show full original sensitive values in chat unless the user explicitly provided them and needs them referenced.
 - Do not export raw mappings unless the user asks; raw mappings are sensitive artifacts and are written only to `--mapping`, never to stdout or reports.
 - Treat review-marked copies from `mark_review.py` as sensitive as the raw mapping: they pair original values with replacements, so keep them in a controlled location.
+- When using `review_terms_llm.py`, the submitted evidence and the request cache both contain verbatim source excerpts: send them only to an endpoint the user trusts, treat the cache directory as sensitive, and never commit either. Model output must never be written into documents — replacements come only from the frozen terms file applied by the local code.
 - Prefer reports with category counts, safe path references, locations, and warnings over reports containing original values or raw file paths.
 - Treat `skipped_inputs` as incomplete processing. Explicit unsupported or missing input paths make the CLI exit non-zero.
 - For Excel, scan workbook properties, worksheet titles, string cells, formula expressions, hyperlink text, cell comments (body and author), and non-string field-rule values. Anonymization rewrites string workbook properties, worksheet titles, string cells, hyperlink text, and cell comments, but refuses to save output when formula expressions or non-string field-rule values still contain detected sensitive values.
