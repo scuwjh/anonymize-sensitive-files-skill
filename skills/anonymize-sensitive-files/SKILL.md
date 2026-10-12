@@ -1,6 +1,6 @@
 ---
 name: anonymize-sensitive-files
-description: Use when anonymizing, desensitizing, de-identifying, masking, replacing, or removing sensitive information from PDF, Word DOCX, Markdown, text, contracts, reports, resumes, customer files, or documents containing PII, credentials, financial data, business secrets, names, phones, emails, IDs, addresses, tokens, companies, projects, or custom terms; also use for Chinese requests about 脱敏, 匿名化, 敏感信息, 个人信息, 身份证, 手机号, 邮箱, 地址, 银行卡, 合同, 客户, 公司, 项目, 密钥, or 自定义敏感词.
+description: Use when anonymizing, desensitizing, de-identifying, masking, replacing, or removing sensitive information from PDF, Word DOCX, Markdown, text, contracts, reports, resumes, customer files, or documents containing PII, credentials, financial data, business secrets, names, phones, emails, IDs, addresses, tokens, companies, projects, or custom terms; also use for Chinese requests about 脱敏, 匿名化, 敏感信息, 个人信息, 身份证, 手机号, 邮箱, 地址, 银行卡, 合同, 客户, 公司, 项目, 密钥, or 自定义敏感词; also use when mining or building a sensitive-term list from a corpus before anonymizing, or when marking anonymized output for human review of each change (词表生成, 敏感词提取, 脱敏审核, 修改处标记).
 ---
 
 # Anonymize Sensitive Files
@@ -14,11 +14,13 @@ Use this skill to replace sensitive document data with realistic fake values whi
 1. Identify the input files and file types.
 2. Use the CLI's bundled global field rules for every supported document type; they are loaded by default from `references/sensitive-field-rules.yaml`.
 3. Run `scan` first for unfamiliar or high-risk files.
-4. Process the whole batch in ONE invocation (`--recursive` or all paths at once). Fake values are assigned in order of first appearance, so splitting a batch across separate runs maps the same original value to different fake values in different batches. `--seed` only stabilizes report hashes; it does not keep fake values consistent across runs.
-5. Run `anonymize` to create new output files; the CLI refuses outputs that overwrite originals. Add `--anonymize-filenames` when file names contain entity names, project codenames, or person names, because default output names reuse the original stem.
-6. Run `verify` on anonymized outputs with the same `--terms` file. Verification ignores findings that are built-in fake values, and ignores label-context values that are only fake value plus non-sensitive scaffolding (for example `北京星河科技有限公司（2019/6/15）`); any value that still contains a term or a detected pattern after removing fake values is reported. Residual findings make the CLI exit non-zero.
-7. For field-rule misses, update `references/sensitive-field-rules.yaml` and add or update tests before rerunning anonymization.
-8. Review the JSON report for residual findings, skipped inputs, unsupported content, and warnings. Treat `anonymized` results with zero findings and a `no extractable text layer` warning as unprocessed scanned PDFs that still need OCR.
+4. If the corpus has no terms file yet, run `scripts/build_terms.py` to mine candidate entities from the corpus, then confirm the low-confidence buckets in its audit output before using the draft as `--terms`. Regexes and field rules only catch fixed shapes, so open-set entities such as company names, project codenames, and person names are replaced only if they are in the terms file; this step sets the ceiling of what gets replaced.
+5. Process the whole batch in ONE invocation (`--recursive` or all paths at once). Fake values are assigned in order of first appearance, so splitting a batch across separate runs maps the same original value to different fake values in different batches. `--seed` only stabilizes report hashes; it does not keep fake values consistent across runs.
+6. Run `anonymize` to create new output files; the CLI refuses outputs that overwrite originals. Add `--anonymize-filenames` when file names contain entity names, project codenames, or person names, because default output names reuse the original stem.
+7. Run `verify` on anonymized outputs with the same `--terms` file. Verification ignores findings that are built-in fake values, and ignores label-context values that are only fake value plus non-sensitive scaffolding (for example `北京星河科技有限公司（2019/6/15）`); any value that still contains a term or a detected pattern after removing fake values is reported. Residual findings make the CLI exit non-zero.
+8. When the user needs to review what changed, run `scripts/mark_review.py` on the anonymized outputs with the raw mapping. It marks each replacement with the original value it came from (DOCX comments, Excel fill plus comments, PDF highlights, inline text annotation) and writes a diff list. Treat its output directory as sensitive as the raw mapping.
+9. For field-rule misses, update `references/sensitive-field-rules.yaml` and add or update tests before rerunning anonymization.
+10. Review the JSON report for residual findings, skipped inputs, unsupported content, and warnings. Treat `anonymized` results with zero findings and a `no extractable text layer` warning as unprocessed scanned PDFs that still need OCR.
 
 ## CLI
 
@@ -35,7 +37,11 @@ python3 scripts/run_anonymize.py contract.md --terms sensitive_terms.txt --seed 
 python3 scripts/run_anonymize.py input.docx --field-rules custom_field_rules.yaml
 python3 scripts/run_anonymize.py input.docx --no-field-rules
 python3 scripts/run_anonymize.py output.anonymized.md --mode verify --terms sensitive_terms.txt
+.venv/bin/python scripts/build_terms.py ./docs --out-dir ./terms-build
+.venv/bin/python scripts/mark_review.py --input-dir ./anonymized --mapping raw-mapping.json --out-dir ./review
 ```
+
+`run_anonymize.py` only wraps the scan/anonymize/verify CLI. `build_terms.py` and `mark_review.py` reuse the same virtual environment, so run `run_anonymize.py --help` once (which prepares `.venv`) before using them.
 
 `scripts/run_anonymize.py` automatically creates `.venv`, installs `scripts/requirements.txt`, and runs the real CLI through the virtual environment Python. This avoids polluting global Python installs and works even when the caller cannot activate a shell environment.
 
@@ -102,17 +108,57 @@ plain sensitive phrase
 
 Lines without a category use the generic custom fake-value pool.
 
+## Term List Generation
+
+When the corpus has no terms file, `scripts/build_terms.py` mines candidates locally with plain rules; it calls no external model or service.
+
+```bash
+.venv/bin/python scripts/build_terms.py ./docs --out-dir ./terms-build
+```
+
+It runs six stages: file triage (parsable / scanned / unsupported) → multi-channel candidate discovery (full company names, suffix-less companies, defined abbreviations such as `（下称"XX"）`, institutions, project names, person names after labels such as `法定代表人`, advisor short lists, filename fragments) → stem clustering that only collects forms actually present in the corpus → rule-based category assignment (`org` / `project` / `name`) → filtering of generic words, sentence fragments, cross-entity joins, and fake-pool collisions → per-file coverage check that names files whose hit rate is abnormally low.
+
+Outputs:
+
+| File | Content |
+| --- | --- |
+| `terms-draft.txt` | Draft terms ready for `--terms` (high/medium confidence) |
+| `terms-audit.md` / `.json` | Every candidate cluster with category, file count, and evidence context; low-confidence buckets (person names, broad project names, filename fragments, joined strings) are separate |
+| `regression.md` | Regression check: known entities hit, generic words not wrongly collected |
+| `coverage.md` | Per-file coverage plus a suspected-miss list |
+
+Review the low-confidence buckets and merge in any terms only a human can confirm before relying on the draft. Treat low coverage on a parsable file as a signal of missed entities, and low coverage on a scanned PDF as confirmation that it has no text layer.
+
 ## Global Field Rules
 
 The bundled rules in `references/sensitive-field-rules.yaml` apply to all supported file types, not only contracts. They cover common label/value fields such as emergency contacts, finance contacts, recipients, phone/email fields, addresses, bank accounts, bank routing codes, organizations, and common identifiers.
 
 For Markdown, DOCX, and Excel tables, the CLI also checks adjacent cells: when a cell contains a configured label such as `财务联系人`, `收件人`, or `联行号`, the cell immediately to its right is scanned with that rule. Excel also applies field rules to values below header-like rows, such as `A1=姓名`, `A2=某姓名`. Field labels themselves are preserved; only values are replaced. Excel reports use safe coordinates such as `sheet 1!B2` rather than raw worksheet titles.
 
+## Review Marking
+
+When a human needs to audit what changed, `scripts/mark_review.py` marks every replacement with the original value it came from and emits a diff list. It requires the raw mapping produced by `--export-mapping`.
+
+```bash
+.venv/bin/python scripts/mark_review.py \
+  --input-dir ./anonymized \
+  --mapping raw-mapping.json \
+  --out-dir ./review
+```
+
+- DOCX: highlight the replacement and add a Word comment with original value, fake value, and category.
+- XLSX / XLSM: fill the cell and add a comment.
+- PDF: highlight annotation plus a note carrying the original and fake value.
+- Text formats: inline annotation in the form `fake〔orig:original〕`.
+
+It also writes `review-diff.txt` for reading and `review-diff.json` for filtering. The output directory, like the raw mapping, contains original sensitive values: keep it in a controlled location and never ship it with the anonymized deliverables.
+
 ## Safety Rules
 
 - Do not overwrite original files.
 - Do not show full original sensitive values in chat unless the user explicitly provided them and needs them referenced.
 - Do not export raw mappings unless the user asks; raw mappings are sensitive artifacts and are written only to `--mapping`, never to stdout or reports.
+- Treat review-marked copies from `mark_review.py` as sensitive as the raw mapping: they pair original values with replacements, so keep them in a controlled location.
 - Prefer reports with category counts, safe path references, locations, and warnings over reports containing original values or raw file paths.
 - Treat `skipped_inputs` as incomplete processing. Explicit unsupported or missing input paths make the CLI exit non-zero.
 - For Excel, scan workbook properties, worksheet titles, string cells, formula expressions, hyperlink text, cell comments (body and author), and non-string field-rule values. Anonymization rewrites string workbook properties, worksheet titles, string cells, hyperlink text, and cell comments, but refuses to save output when formula expressions or non-string field-rule values still contain detected sensitive values.

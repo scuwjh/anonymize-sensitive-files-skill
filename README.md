@@ -13,9 +13,12 @@
 - [效果示例](#效果示例)
 - [支持的文件格式](#支持的文件格式)
 - [主要能力](#主要能力)
+- [目录批处理](#目录批处理)
 - [自定义敏感词](#自定义敏感词)
+- [词表生成](#词表生成)
 - [报告与映射](#报告与映射)
 - [安全策略](#安全策略)
+- [人工审核](#人工审核)
 - [测试](#测试)
 - [维护说明](#维护说明)
 - [开源协议](#开源协议)
@@ -25,7 +28,7 @@
 通过 `npx skills` 安装到 Codex：
 
 ```bash
-npx --yes skills add zongzack/anonymize-sensitive-files-skill \
+npx --yes skills add scuwjh/anonymize-sensitive-files-skill \
   --skill anonymize-sensitive-files \
   --agent codex \
   -g
@@ -34,19 +37,19 @@ npx --yes skills add zongzack/anonymize-sensitive-files-skill \
 安装到所有支持的 agent：
 
 ```bash
-npx --yes skills add zongzack/anonymize-sensitive-files-skill --all
+npx --yes skills add scuwjh/anonymize-sensitive-files-skill --all
 ```
 
 只生成一次性使用提示、不安装：
 
 ```bash
-npx --yes skills use zongzack/anonymize-sensitive-files-skill@anonymize-sensitive-files
+npx --yes skills use scuwjh/anonymize-sensitive-files-skill@anonymize-sensitive-files
 ```
 
 如需先确认仓库内可用的 skill：
 
 ```bash
-npx --yes skills add zongzack/anonymize-sensitive-files-skill -l
+npx --yes skills add scuwjh/anonymize-sensitive-files-skill -l
 ```
 
 支持从 GitHub repo path 安装 skill 的平台，也可以直接指向：
@@ -150,6 +153,9 @@ python3 scripts/run_anonymize.py path/to/input.anonymized.md \
 - 支持脱敏输出文件名（`--anonymize-filenames`），避免 `FS-02_某某项目-统计表.docx` 这类文件名继续泄露项目代号。
 - 替换值不会包含任何已知敏感原值：当假值候选等于或内含词表词、或内含本次已替换过的原值时自动换下一个候选，避免出现 `星河集团 → 北京星河科技有限公司` 这种品牌字面残留。
 - 业务类假值池按下拉生成扩容到 60-84 个候选，避免上百个真实实体挤进 12 个假名。
+- PDF 脱敏的替换文字使用内置中文字体（`china-s`）写入，保证简体、繁体和全角标点正确渲染；替换文字过长时会自动缩小字号以适应原占位框。
+- 提供词表生成器 `scripts/build_terms.py`：从语料自动挖掘公司、项目、机构、人员等候选实体，做类别判定与文件级覆盖校验，输出可直接使用的候选词表和人工审计表。
+- 提供审核标记工具 `scripts/mark_review.py`：在脱敏产物上标出每一处替换（假值对应哪个原值），并生成 diff 清单，便于逐条人工复核。
 - 支持 Markdown 表格、DOCX 表格和 Excel 工作表里的相邻字段，例如 `A1=法定代表人`, `B1=某姓名`；Excel 也支持列头在上、值在下的字段规则，例如 `A1=姓名`, `A2=某姓名`。
 - Excel 处理覆盖工作簿属性、工作表名、字符串单元格和 hyperlink 文本/目标，并会尽量保留工作簿、样式、隐藏表和宏；批注、图片、图表、文本框、透视表、嵌入对象和宏代码需要额外复核。
 - `.xlsm` 会保留 VBA 项目，但不会扫描或修改宏代码。
@@ -206,6 +212,34 @@ customer:示例客户
 
 带分类的词会使用对应假数据池；未分类的词会按通用自定义敏感词处理。
 
+## 词表生成
+
+没有现成词表时，`scripts/build_terms.py` 可以从语料自动生成候选词表。它是纯本地规则实现，不调用任何外部模型或接口：
+
+```bash
+.venv/bin/python scripts/build_terms.py ./docs --out-dir ./terms-build
+```
+
+处理流程分六个阶段：
+
+1. **文件分级** —— 区分可解析（有文本层）、扫描件（无文本层，需 OCR）和不支持的格式，避免把「零检出」误当成「已处理」。
+2. **候选发现** —— 多通道正则并集：公司全称、无后缀公司（如 `哈尔滨综合开发公司`）、简称定义点（`（下称"XX"）`）、机构、项目名、人名定义点（`法定代表人XX`）、中介简称列表、文件名片段。此处宁可多收，准确性交给后续过滤。
+3. **词干聚类** —— 去掉公司/机构/项目后缀后聚成实体簇，只搜集语料中实际出现过的形态，不生成语料里没有的词条。
+4. **类别判定** —— 依据通道来源与后缀特征投票判定 `org` / `project` / `name`，类别决定后续使用哪个假值池。
+5. **规则过滤** —— 通用词、行政区划、句法碎片、跨实体拼接体、与假值池冲突的词条会被剔除或降到低置信桶。
+6. **覆盖校验** —— 逐文件统计「候选实体数」与「词表命中数」，覆盖率异常低的文件会被点名，提示存在遗漏或该文件是扫描件。
+
+产出：
+
+| 文件 | 内容 |
+| --- | --- |
+| `terms-draft.txt` | 可直接用于 `--terms` 的候选词表（高/中置信） |
+| `terms-audit.md` / `terms-audit.json` | 全部候选簇：类别、出现文件数、证据上下文；低置信候选（人名、宽泛项目名、文件名片段、拼接体）单独分桶 |
+| `regression.md` | 回归结果：已知实体是否命中、通用词是否被误收 |
+| `coverage.md` | 逐文件覆盖率明细与疑似漏检清单 |
+
+词表是脱敏效果的上限：正则和字段规则只能发现「有固定形态」的敏感值，公司名、项目代号这类开放集合实体若不在词表里就不会被替换，`verify` 也不会报错。因此建议先跑一次词表生成，人工确认低置信分桶后，再带 `--terms` 执行正式脱敏。
+
 ## 报告与映射
 
 默认报告不会输出原始敏感值或原始文件路径，只包含安全路径引用、扩展名、类别、脱敏位置、长度、统计信息和警告。`verify` 会忽略假值本身，也会忽略“假值 + 无敏感信息的括号日期尾巴”这类组合串，但对仍包含词表词或正则可检值的单元格一律报残留。Excel 报告位置使用 `sheet 1!A1`、`workbook property title` 这类不含原始工作表名或属性值的坐标。
@@ -240,7 +274,29 @@ python3 scripts/run_anonymize.py input.md \
 
 扫描件 PDF、图片、`.xls`、`.doc` 和 `.jpg` 不在自动覆盖范围内：状态为 `anonymized` 但检出为 0 且带 `no extractable text layer` 警告的 PDF，应视为尚未处理，需要 OCR 或人工复核。
 
-没有现成敏感词表时，可以先扫一遍语料、汇总标签规则已经检出的取值，再补上跨文件共享前缀和文件名里的项目代号，生成词表后带 `--terms` 重跑。
+没有现成敏感词表时，先用 `scripts/build_terms.py` 从语料生成候选词表（见 [词表生成](#词表生成)），人工确认低置信候选后带 `--terms` 重跑；也可以先扫一遍语料、汇总标签规则已经检出的取值，再补上跨文件共享前缀和文件名里的项目代号。
+
+## 人工审核
+
+自动脱敏的结果需要人工确认。`scripts/mark_review.py` 会在脱敏副本上标出每一处替换及对应原值，便于逐条比对：
+
+```bash
+.venv/bin/python scripts/mark_review.py \
+  --input-dir ./anonymized \
+  --mapping raw-mapping.json \
+  --out-dir ./review
+```
+
+各格式的标记方式：
+
+- **DOCX**：替换处高亮，并写入 Word 批注（原值 → 假值、类别）
+- **XLSX / XLSM**：单元格填充色标记，并写入批注
+- **PDF**：高亮注解，并叠加备注（原值 → 假值）
+- **文本类**：行内标注，形如 `假值〔原:原值〕`
+
+除标记副本外，还会输出 `review-diff.txt`（通读用）和 `review-diff.json`（结构化清单，便于筛选和统计）。
+
+该工具需要 `--export-mapping` 生成的明文映射作为输入。`review/` 目录与明文映射文件一样含原始敏感值，必须存放在受控位置，不要随脱敏产物一起对外分发。
 
 ## 测试
 
@@ -269,11 +325,14 @@ skills/anonymize-sensitive-files/
 │   ├── sensitive-field-rules.yaml
 │   └── supported-formats.md
 └── scripts/
-    ├── anonymize_files.py
-    ├── detectors.py
-    ├── fake_data.py
+    ├── run_anonymize.py      # 入口：自动创建 .venv 并转发到 anonymize_files.py
+    ├── anonymize_files.py    # scan / anonymize / verify 主流程与各格式读写
+    ├── detectors.py          # 内置正则与字段规则检测
+    ├── fake_data.py          # 假值池与映射（假值一致性、防品牌残留）
+    ├── build_terms.py        # 实体词表生成器（候选发现 → 聚类 → 覆盖校验）
+    ├── mark_review.py        # 脱敏产物审核标记（批注 / 高亮 / diff 清单）
     ├── requirements.txt
-    └── run_anonymize.py
+    └── test_*.py             # unittest 回归测试
 ```
 
 公开发布时请只提交源码、规则、文档和测试，不要提交真实业务文件、脱敏输入样本、运行报告、明文映射文件、生成的脱敏副本或本地虚拟环境目录。尤其是 `--export-mapping` 生成的映射文件包含原始敏感值，只应保存在受控位置。
