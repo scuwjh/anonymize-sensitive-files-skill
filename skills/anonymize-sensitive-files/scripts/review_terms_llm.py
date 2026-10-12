@@ -17,10 +17,11 @@
      低置信 keep 进待人工桶。
 
 用法：
+  # 配置全部走环境变量，密钥不落盘：
+  #   ANONYMIZE_LLM_ENDPOINT / ANONYMIZE_LLM_MODEL / ANONYMIZE_LLM_API_KEY
   .venv/bin/python scripts/review_terms_llm.py \
       --audit ./terms-build/terms-audit.json \
-      --out-dir ./terms-build \
-      --llm-config scripts/llm-config.json
+      --out-dir ./terms-build
   加 --dry-run 可在没有 API key 的情况下走完整流程（用本地桩替代网络调用）。
 """
 from __future__ import annotations
@@ -369,10 +370,9 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="离线 LLM 候选审核（四道闸门 + 三桶）")
     ap.add_argument("--audit", type=Path, required=True, help="build_terms.py 产出的 terms-audit.json")
     ap.add_argument("--out-dir", type=Path, required=True)
-    ap.add_argument("--llm-config", type=Path, help="llm-config.json 路径")
-    ap.add_argument("--llm-endpoint", help="覆盖配置里的 endpoint")
-    ap.add_argument("--llm-model", help="覆盖配置里的 model")
-    ap.add_argument("--cache-dir", help="覆盖配置里的 cache_dir")
+    ap.add_argument("--llm-endpoint", help="覆盖环境变量 ANONYMIZE_LLM_ENDPOINT")
+    ap.add_argument("--llm-model", help="覆盖环境变量 ANONYMIZE_LLM_MODEL")
+    ap.add_argument("--cache-dir", help="覆盖环境变量 ANONYMIZE_LLM_CACHE_DIR")
     ap.add_argument("--batch-size", type=int, default=15)
     ap.add_argument("--min-confidence", type=float, default=0.6)
     ap.add_argument("--limit", type=int, help="只审前 N 条（控制成本）")
@@ -390,32 +390,32 @@ def main(argv: list[str] | None = None) -> int:
         "model": args.llm_model,
         "cache_dir": args.cache_dir,
     }
+    try:
+        config = LLMConfig.from_env(overrides)
+    except LLMError as exc:
+        print(f"配置错误: {exc}", file=sys.stderr)
+        return 2
+
     if args.dry_run:
-        config = LLMConfig.load(args.llm_config, overrides)
         if not config.endpoint:
             config.endpoint = "dry-run://local"
+        if not config.model:
+            config.model = "dry-run-stub"
         config.cache_dir = config.cache_dir.rstrip("/") + "-dryrun"
-        cache = RequestCache(config.cache_dir)
-        client = LLMClient(config, cache=cache, transport=dry_run_transport)
+        client = LLMClient(config, cache=RequestCache(config.cache_dir), transport=dry_run_transport)
         mode = "dry-run"
     else:
-        try:
-            client = LLMClient(
-                LLMConfig.load(args.llm_config, {**overrides, "cache_dir": args.cache_dir or None})
-            )
-            client.config.validate()
-            if not client.config.resolved_key():
-                print(
-                    "未找到 API key：请在 llm-config.json 填 api_key，或设置环境变量 "
-                    f"{client.config.api_key_env}；也可先用 --dry-run 演练。",
-                    file=sys.stderr,
-                )
-                return 2
-        except LLMError as exc:
-            print(f"配置错误: {exc}", file=sys.stderr)
+        missing = config.missing()
+        if missing:
+            print("缺少必要配置，请设置以下环境变量：", file=sys.stderr)
+            for name in missing:
+                print(f"  {name}", file=sys.stderr)
+            print("提示：可先用 --dry-run 在没有密钥的情况下演练完整流程。", file=sys.stderr)
             return 2
+        client = LLMClient(config)
         mode = "api"
 
+    print(f"配置: {client.config.summary()}")
     print(f"送审 {len(candidates)} 条候选，批大小 {args.batch_size}，模式 {mode} ...")
     verdicts = review(candidates, client, args.batch_size, args.min_confidence)
     stats = write_outputs(

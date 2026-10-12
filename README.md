@@ -244,14 +244,19 @@ customer:示例客户
 
 ## LLM 辅助审核
 
-`scripts/build_terms.py` 的候选里，类别判定和「是不是敏感实体」本质是语义问题，纯规则会有天花板（人名边界、宽泛项目名、未定义简称等）。可选接入大模型对候选做语义审核：
+`scripts/build_terms.py` 的候选里，类别判定和「是不是敏感实体」本质是语义问题，纯规则会有天花板（人名边界、宽泛项目名、未定义简称等）。可选接入大模型对候选做语义审核。配置全部通过**环境变量**注入，密钥不落盘：
 
 ```bash
-# 1. 复制配置样例，填入你的 endpoint / model / api_key
-cp skills/anonymize-sensitive-files/scripts/llm-config.example.json \
-   skills/anonymize-sensitive-files/scripts/llm-config.json
+# 1. 注入配置（方式 A：仅当前终端会话有效）
+export ANONYMIZE_LLM_ENDPOINT="https://你的端点/v1/chat/completions"
+export ANONYMIZE_LLM_MODEL="deepseek-v41-flash"
+export ANONYMIZE_LLM_API_KEY="sk-..."
 
-# 2. 先用演练模式验证流程（不联网，用本地桩）
+# 方式 B：单次注入，密钥不进 shell history，也不残留到后续命令
+ANONYMIZE_LLM_API_KEY="sk-..." ANONYMIZE_LLM_ENDPOINT="https://…" ANONYMIZE_LLM_MODEL="…" \
+  .venv/bin/python scripts/review_terms_llm.py --audit … --out-dir …
+
+# 2. 先用演练模式验证流程（不联网、不需要任何环境变量）
 .venv/bin/python scripts/review_terms_llm.py \
   --audit ./terms-build/terms-audit.json \
   --out-dir ./terms-build \
@@ -261,20 +266,23 @@ cp skills/anonymize-sensitive-files/scripts/llm-config.example.json \
 .venv/bin/python scripts/review_terms_llm.py \
   --audit ./terms-build/terms-audit.json \
   --out-dir ./terms-build \
-  --llm-config scripts/llm-config.json \
   --batch-size 15 --min-confidence 0.6
 ```
 
-配置项（`llm-config.json`，该文件已在 `.gitignore` 中，不会入库）：
+环境变量（优先级：CLI 参数 > 环境变量 > 默认值）：
 
-| 字段 | 说明 |
-| --- | --- |
-| `endpoint` | OpenAI 兼容的 `/chat/completions` 地址 |
-| `model` | 模型名 |
-| `api_key` | 密钥；留空则读 `api_key_env` 指定的环境变量 |
-| `api_key_env` | 环境变量名，默认 `DEEPSEEK_API_KEY` |
-| `timeout_seconds` / `max_retries` / `temperature` | 超时、重试次数、采样温度（默认 0） |
-| `cache_dir` | 请求级缓存目录，默认 `.llm-cache` |
+| 变量 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `ANONYMIZE_LLM_ENDPOINT` | ✅ | — | OpenAI 兼容的 `/chat/completions` 地址 |
+| `ANONYMIZE_LLM_MODEL` | ✅ | — | 模型名 |
+| `ANONYMIZE_LLM_API_KEY` | ✅ | — | 密钥；未设置时回退读 `DEEPSEEK_API_KEY` |
+| `ANONYMIZE_LLM_TIMEOUT` | | `60` | 单次请求超时（秒） |
+| `ANONYMIZE_LLM_MAX_RETRIES` | | `2` | 失败重试次数 |
+| `ANONYMIZE_LLM_MAX_TOKENS` | | `4096` | 单次响应上限 |
+| `ANONYMIZE_LLM_TEMPERATURE` | | `0` | 采样温度 |
+| `ANONYMIZE_LLM_CACHE_DIR` | | `.llm-cache` | 请求缓存目录 |
+
+临时切换端点或模型可用 `--llm-endpoint` / `--llm-model` / `--cache-dir` 覆盖。启动时会打印一行配置摘要（端点主机、模型、缓存目录），密钥一律显示为 `sk-***`；密钥不会出现在报告、日志或缓存里。
 
 **四道闸门**（每条模型判定都要过，不过即丢弃并计数）：
 
@@ -291,7 +299,7 @@ cp skills/anonymize-sensitive-files/scripts/llm-config.example.json \
 | `llm-review.md` | 人读版：自动采纳 / 建议否决 / 待人工 / 丢弃统计 |
 | `terms-llm-accepted.txt` | 经模型确认的候选词表，供与人工裁决结果合并 |
 
-稳定性和可复现性：审核是**构建期的离线一次性环节**，正式脱敏运行不调用任何模型；审核结果按 `(model, prompt 版本, 输入)` 落盘缓存，重跑命中缓存不重复请求（实测第二遍 0 次网络调用）；词表经人工确认后冻结，同一批次重跑结果一致。
+稳定性和可复现性：审核是**构建期的离线一次性环节**，正式脱敏运行不调用任何模型；审核结果按 `(model, prompt 版本, 输入)` 落盘缓存，重跑命中缓存不重复请求（实测第二遍 0 次网络调用）；词表经人工确认后冻结，同一批次重跑结果一致。单批调用失败只会把该批候选降级为待人工，不会中断整批，也不会漏候选。
 
 ## 报告与映射
 
@@ -323,6 +331,7 @@ python3 scripts/run_anonymize.py input.md \
 - Excel 相邻字段右侧的数字、日期、布尔值等非字符串单元格如检出敏感值，脱敏模式会失败而不是静默保留。
 - 扫描件、图片中的文字、PDF 注释、DOCX 页眉页脚、文本框、批注和修订痕迹需要额外人工复核。
 - 使用 LLM 辅助审核时，送审内容与请求缓存都包含原文片段，属于敏感产物：只应发往你信任的端点，缓存目录按敏感数据处理，不要入库或对外分发。模型输出永远不直接写入文件——替换只由本地代码依据冻结词表执行。
+- 密钥只从环境变量读取，不写入任何文件、报告或缓存；打印配置摘要时统一遮蔽为 `sk-***`。注意环境变量对同机同用户的进程可见，多用户或存在不可信进程的机器上建议改用钥匙串临时注入，不要把密钥写进 `~/.zshrc`。
 
 本工具不能替代最终人工审核。高风险文件建议按 `scan` -> `anonymize` -> `verify` 的顺序处理，并根据报告中的 warning 复核不受自动处理覆盖的内容。
 
@@ -384,10 +393,9 @@ skills/anonymize-sensitive-files/
     ├── detectors.py          # 内置正则与字段规则检测
     ├── fake_data.py          # 假值池与映射（假值一致性、防品牌残留）
     ├── build_terms.py        # 实体词表生成器（候选发现 → 聚类 → 覆盖校验）
-    ├── llm_client.py         # OpenAI 兼容调用与请求级缓存（标准库实现，无第三方依赖）
+    ├── llm_client.py         # OpenAI 兼容调用与请求级缓存（配置走环境变量，标准库实现）
     ├── review_terms_llm.py   # 可选：LLM 候选审核（四道闸门 + 三桶分流）
     ├── mark_review.py        # 脱敏产物审核标记（批注 / 高亮 / diff 清单）
-    ├── llm-config.example.json  # LLM 配置样例（真实 llm-config.json 与缓存不入库）
     ├── requirements.txt
     └── test_*.py             # unittest 回归测试
 ```

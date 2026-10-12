@@ -139,7 +139,18 @@ When an OpenAI-compatible endpoint is available, `scripts/review_terms_llm.py` r
   --audit ./terms-build/terms-audit.json --out-dir ./terms-build --dry-run
 ```
 
-Copy `scripts/llm-config.example.json` to `scripts/llm-config.json` and fill `endpoint`, `model`, and `api_key` (or leave `api_key` empty and set the environment variable named by `api_key_env`). The real config file and the request cache are gitignored.
+Configuration comes from environment variables only, so no secret is written to disk:
+
+```bash
+export ANONYMIZE_LLM_ENDPOINT="https://your-endpoint/v1/chat/completions"
+export ANONYMIZE_LLM_MODEL="deepseek-v41-flash"
+export ANONYMIZE_LLM_API_KEY="sk-..."
+```
+
+- Required: `ANONYMIZE_LLM_ENDPOINT`, `ANONYMIZE_LLM_MODEL`, `ANONYMIZE_LLM_API_KEY` (falls back to `DEEPSEEK_API_KEY`).
+- Optional: `ANONYMIZE_LLM_TIMEOUT`, `ANONYMIZE_LLM_MAX_RETRIES`, `ANONYMIZE_LLM_MAX_TOKENS`, `ANONYMIZE_LLM_TEMPERATURE`, `ANONYMIZE_LLM_CACHE_DIR`.
+- Precedence: CLI flags (`--llm-endpoint`, `--llm-model`, `--cache-dir`) > environment > defaults.
+- If a required variable is missing the tool lists exactly which ones and exits; `--dry-run` needs no variables at all. The startup line prints a config summary with the key masked as `sk-***`.
 
 Every verdict must pass four gates; a failing verdict is dropped and counted, never silently accepted:
 
@@ -181,6 +192,7 @@ It also writes `review-diff.txt` for reading and `review-diff.json` for filterin
 - Do not export raw mappings unless the user asks; raw mappings are sensitive artifacts and are written only to `--mapping`, never to stdout or reports.
 - Treat review-marked copies from `mark_review.py` as sensitive as the raw mapping: they pair original values with replacements, so keep them in a controlled location.
 - When using `review_terms_llm.py`, the submitted evidence and the request cache both contain verbatim source excerpts: send them only to an endpoint the user trusts, treat the cache directory as sensitive, and never commit either. Model output must never be written into documents — replacements come only from the frozen terms file applied by the local code.
+- API keys for the LLM step are read from environment variables only and must never be written into a file, report, or cache; the tool masks them as `sk-***` in every message. Warn the user that environment variables are visible to same-user processes, so they should not export the key in `~/.zshrc` on a shared machine.
 - Prefer reports with category counts, safe path references, locations, and warnings over reports containing original values or raw file paths.
 - Treat `skipped_inputs` as incomplete processing. Explicit unsupported or missing input paths make the CLI exit non-zero.
 - For Excel, scan workbook properties, worksheet titles, string cells, formula expressions, hyperlink text, cell comments (body and author), and non-string field-rule values. Anonymization rewrites string workbook properties, worksheet titles, string cells, hyperlink text, and cell comments, but refuses to save output when formula expressions or non-string field-rule values still contain detected sensitive values.

@@ -1,9 +1,20 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from llm_client import LLMClient, LLMConfig, LLMError, RequestCache, extract_json
+from llm_client import (
+    ENV_PREFIX,
+    FALLBACK_API_KEY_ENV,
+    LLMClient,
+    LLMConfig,
+    LLMError,
+    RequestCache,
+    extract_json,
+    mask_key,
+)
 from review_terms_llm import (
     Candidate,
     apply_gates,
@@ -299,6 +310,97 @@ class LoadCandidatesTest(unittest.TestCase):
             limited = load_candidates(p, include_low=True, limit=1)
             self.assertEqual([c.term for c in limited], ["甲公司"])
             self.assertEqual(both[0].evidence, ["由甲公司持有"])
+
+
+class ConfigFromEnvTest(unittest.TestCase):
+    """配置全部来自环境变量，密钥不落盘。"""
+
+    def test_from_env_reads_all_values(self):
+        env = {
+            ENV_PREFIX + "ENDPOINT": "https://example.com/v1/chat/completions",
+            ENV_PREFIX + "MODEL": "deepseek-v41-flash",
+            ENV_PREFIX + "API_KEY": "sk-abcdef123456",
+            ENV_PREFIX + "TIMEOUT": "30",
+            ENV_PREFIX + "MAX_RETRIES": "5",
+            ENV_PREFIX + "MAX_TOKENS": "1024",
+            ENV_PREFIX + "TEMPERATURE": "0.2",
+            ENV_PREFIX + "CACHE_DIR": "/tmp/cache-x",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            cfg = LLMConfig.from_env()
+        self.assertEqual(cfg.endpoint, "https://example.com/v1/chat/completions")
+        self.assertEqual(cfg.model, "deepseek-v41-flash")
+        self.assertEqual(cfg.api_key, "sk-abcdef123456")
+        self.assertEqual(cfg.timeout_seconds, 30.0)
+        self.assertEqual(cfg.max_retries, 5)
+        self.assertEqual(cfg.max_tokens, 1024)
+        self.assertEqual(cfg.temperature, 0.2)
+        self.assertEqual(cfg.cache_dir, "/tmp/cache-x")
+        self.assertEqual(cfg.missing(), [])
+
+    def test_missing_reports_actionable_env_names(self):
+        with patch.dict(os.environ, {}, clear=True):
+            cfg = LLMConfig.from_env()
+        missing = cfg.missing()
+        self.assertIn(ENV_PREFIX + "ENDPOINT", missing)
+        self.assertIn(ENV_PREFIX + "MODEL", missing)
+        self.assertTrue(any("API_KEY" in name for name in missing))
+        with self.assertRaises(LLMError):
+            cfg.validate()
+
+    def test_api_key_falls_back_to_deepseek_env(self):
+        with patch.dict(os.environ, {FALLBACK_API_KEY_ENV: "sk-fallback98765"}, clear=True):
+            cfg = LLMConfig.from_env()
+        self.assertEqual(cfg.api_key, "sk-fallback98765")
+
+    def test_explicit_key_wins_over_fallback_env(self):
+        env = {ENV_PREFIX + "API_KEY": "sk-explicit", FALLBACK_API_KEY_ENV: "sk-fallback"}
+        with patch.dict(os.environ, env, clear=True):
+            cfg = LLMConfig.from_env()
+        self.assertEqual(cfg.api_key, "sk-explicit")
+
+    def test_cli_override_beats_env(self):
+        with patch.dict(os.environ, {ENV_PREFIX + "MODEL": "from-env"}, clear=True):
+            cfg = LLMConfig.from_env({"model": "from-cli"})
+        self.assertEqual(cfg.model, "from-cli")
+
+    def test_none_override_is_ignored(self):
+        with patch.dict(os.environ, {ENV_PREFIX + "MODEL": "from-env"}, clear=True):
+            cfg = LLMConfig.from_env({"model": None})
+        self.assertEqual(cfg.model, "from-env")
+
+    def test_unknown_override_rejected(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(LLMError):
+                LLMConfig.from_env({"nope": "x"})
+
+    def test_invalid_numbers_raise(self):
+        with patch.dict(os.environ, {ENV_PREFIX + "TIMEOUT": "abc"}, clear=True):
+            with self.assertRaises(LLMError):
+                LLMConfig.from_env()
+        with patch.dict(os.environ, {ENV_PREFIX + "MAX_RETRIES": "两"}, clear=True):
+            with self.assertRaises(LLMError):
+                LLMConfig.from_env()
+
+    def test_mask_key_never_reveals_secret(self):
+        self.assertEqual(mask_key(""), "（未设置）")
+        self.assertEqual(mask_key("short"), "***")
+        masked = mask_key("sk-abcdef1234567890")
+        self.assertTrue(masked.startswith("sk-"))
+        self.assertIn("***", masked)
+        self.assertNotIn("abcdef", masked)
+
+    def test_summary_is_safe_to_print(self):
+        cfg = LLMConfig(
+            endpoint="https://api.example.com/v1/chat/completions",
+            model="deepseek-v41-flash",
+            api_key="sk-secretvalue123456",
+        )
+        summary = cfg.summary()
+        self.assertIn("api.example.com", summary)
+        self.assertIn("deepseek-v41-flash", summary)
+        self.assertIn("***", summary)
+        self.assertNotIn("secretvalue", summary)
 
 
 if __name__ == "__main__":

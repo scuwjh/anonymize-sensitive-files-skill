@@ -7,9 +7,18 @@
   - 所有请求按 (model, prompt_version, 输入) 缓存到磁盘，重跑不重复调用；
   - 网络/解析失败按次数退避重试，最终失败抛 LLMError 由调用方降级处理。
 
-配置来源优先级：
-  显式 --llm-config 路径 > scripts/llm-config.json > ~/.config/anonymize-skill/llm-config.json
-API key 优先级：配置文件 api_key > 环境变量 api_key_env。
+配置全部通过环境变量注入，密钥不落盘（不读配置文件）：
+  ANONYMIZE_LLM_ENDPOINT    必填，OpenAI 兼容的 /chat/completions 地址
+  ANONYMIZE_LLM_MODEL       必填，模型名
+  ANONYMIZE_LLM_API_KEY     必填，密钥；未设置时回退读 DEEPSEEK_API_KEY
+  ANONYMIZE_LLM_TIMEOUT     可选，单次请求超时秒数，默认 60
+  ANONYMIZE_LLM_MAX_RETRIES 可选，失败重试次数，默认 2
+  ANONYMIZE_LLM_MAX_TOKENS  可选，单次响应上限，默认 4096
+  ANONYMIZE_LLM_TEMPERATURE 可选，采样温度，默认 0
+  ANONYMIZE_LLM_CACHE_DIR   可选，请求缓存目录，默认 .llm-cache
+
+优先级：显式传参（CLI 覆盖）> 环境变量 > 默认值。
+密钥永不写日志、不进报告、不进缓存；打印时一律经 mask_key() 遮蔽。
 """
 from __future__ import annotations
 
@@ -22,26 +31,54 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 # 提示词版本：任何影响判定的提示词改动都必须递增，否则缓存会返回旧结果。
 PROMPT_VERSION = "terms-review-v1"
 
-DEFAULT_CONFIG_PATHS = (
-    Path("scripts/llm-config.json"),
-    Path.home() / ".config" / "anonymize-skill" / "llm-config.json",
-)
+ENV_PREFIX = "ANONYMIZE_LLM_"
+FALLBACK_API_KEY_ENV = "DEEPSEEK_API_KEY"
 
 
 class LLMError(RuntimeError):
-    """调用或解析失败（已重试耗尽）。"""
+    """配置、调用或解析失败（重试已耗尽）。"""
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(ENV_PREFIX + name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise LLMError(f"环境变量 {ENV_PREFIX + name} 不是合法数字: {raw!r}") from exc
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(ENV_PREFIX + name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise LLMError(f"环境变量 {ENV_PREFIX + name} 不是合法整数: {raw!r}") from exc
+
+
+def mask_key(key: str) -> str:
+    """遮蔽密钥，用于日志与配置摘要。绝不返回完整密钥。"""
+    key = (key or "").strip()
+    if not key:
+        return "（未设置）"
+    if len(key) <= 6:
+        return "***"
+    return f"{key[:3]}***"
 
 
 @dataclass
 class LLMConfig:
     endpoint: str = ""
-    model: str = "deepseek-v41-flash"
+    model: str = ""
     api_key: str = ""
-    api_key_env: str = "DEEPSEEK_API_KEY"
     timeout_seconds: float = 60.0
     max_retries: int = 2
     retry_backoff_seconds: float = 2.0
@@ -50,33 +87,54 @@ class LLMConfig:
     cache_dir: str = ".llm-cache"
     use_json_response_format: bool = False
 
-    def resolved_key(self) -> str:
-        if self.api_key and self.api_key.strip():
-            return self.api_key.strip()
-        return os.environ.get(self.api_key_env, "").strip()
-
     @classmethod
-    def load(cls, path: Path | None = None, overrides: dict[str, Any] | None = None) -> "LLMConfig":
-        data: dict[str, Any] = {}
-        candidates = (path,) if path is not None else DEFAULT_CONFIG_PATHS
-        for cand in candidates:
-            if cand and Path(cand).is_file():
-                data = json.loads(Path(cand).read_text(encoding="utf-8"))
-                break
+    def from_env(cls, overrides: dict[str, Any] | None = None) -> "LLMConfig":
+        """从环境变量构造配置；overrides 中非 None 的项覆盖环境变量。"""
+        env = os.environ
+        cfg = cls(
+            endpoint=env.get(ENV_PREFIX + "ENDPOINT", "").strip(),
+            model=env.get(ENV_PREFIX + "MODEL", "").strip(),
+            api_key=(
+                env.get(ENV_PREFIX + "API_KEY", "").strip()
+                or env.get(FALLBACK_API_KEY_ENV, "").strip()
+            ),
+            timeout_seconds=_env_float("TIMEOUT", 60.0),
+            max_retries=_env_int("MAX_RETRIES", 2),
+            max_tokens=_env_int("MAX_TOKENS", 4096),
+            temperature=_env_float("TEMPERATURE", 0.0),
+            cache_dir=env.get(ENV_PREFIX + "CACHE_DIR", ".llm-cache").strip() or ".llm-cache",
+        )
         for key, value in (overrides or {}).items():
             if value is not None:
-                data[key] = value
-        allowed = set(cls.__dataclass_fields__)  # type: ignore[attr-defined]
-        unknown = sorted(set(data) - allowed)
-        if unknown:
-            raise LLMError(f"配置文件包含未知字段: {', '.join(unknown)}")
-        return cls(**{k: v for k, v in data.items() if k in allowed})
+                if key not in cls.__dataclass_fields__:  # type: ignore[attr-defined]
+                    raise LLMError(f"未知配置项: {key}")
+                setattr(cfg, key, value)
+        return cfg
+
+    def missing(self) -> list[str]:
+        """返回缺失的必填环境变量名，供调用方给出可操作的报错。"""
+        missing: list[str] = []
+        if not self.endpoint.strip():
+            missing.append(ENV_PREFIX + "ENDPOINT")
+        if not self.model.strip():
+            missing.append(ENV_PREFIX + "MODEL")
+        if not self.api_key.strip():
+            missing.append(f"{ENV_PREFIX}API_KEY（或 {FALLBACK_API_KEY_ENV}）")
+        return missing
 
     def validate(self) -> None:
-        if not self.endpoint.strip():
-            raise LLMError("未配置 endpoint：请在 llm-config.json 中填写 endpoint，或用 --llm-endpoint 指定")
-        if not self.model.strip():
-            raise LLMError("未配置 model")
+        missing = self.missing()
+        if missing:
+            raise LLMError("缺少必要配置，请设置环境变量：" + "、".join(missing))
+
+    def summary(self) -> str:
+        """配置摘要（含遮蔽后的密钥），可安全打印。"""
+        host = urlsplit(self.endpoint).netloc or self.endpoint
+        return (
+            f"endpoint={host} model={self.model} api_key={mask_key(self.api_key)} "
+            f"cache_dir={self.cache_dir} timeout={self.timeout_seconds}s "
+            f"max_retries={self.max_retries}"
+        )
 
 
 class RequestCache:
@@ -153,7 +211,7 @@ def default_transport(config: LLMConfig, system: str, user: str) -> str:
         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {config.resolved_key()}",
+            "Authorization": f"Bearer {config.api_key}",
         },
         method="POST",
     )
@@ -162,6 +220,9 @@ def default_transport(config: LLMConfig, system: str, user: str) -> str:
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:400]
+        # 出错信息可能回显请求内容，抛出前做一次密钥遮蔽
+        if config.api_key:
+            detail = detail.replace(config.api_key, mask_key(config.api_key))
         raise LLMError(f"HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise LLMError(f"网络错误: {exc.reason}") from exc
@@ -211,10 +272,9 @@ class LLMClient:
 
 
 def build_client(
-    config_path: Path | None = None,
     overrides: dict[str, Any] | None = None,
     transport: Callable[[LLMConfig, str, str], str] | None = None,
 ) -> LLMClient:
-    config = LLMConfig.load(config_path, overrides)
+    config = LLMConfig.from_env(overrides)
     config.validate()
     return LLMClient(config, transport=transport)
